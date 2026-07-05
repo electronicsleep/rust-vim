@@ -14,6 +14,7 @@ struct VimEngine {
     mode: VimMode,
     cursor: usize,
     pending_d: bool,
+    pending_g: bool,
     command_buf: String,
     status_msg: String,
 }
@@ -24,6 +25,7 @@ impl VimEngine {
             mode: VimMode::Normal,
             cursor: 0,
             pending_d: false,
+            pending_g: false,
             command_buf: String::new(),
             status_msg: String::new(),
         }
@@ -46,7 +48,7 @@ impl VimEngine {
     fn move_up(&mut self, text: &str) {
         let c = self.clamp(text);
         let col = c - self.line_start(text);
-        let prev_end = self.line_start(text).saturating_sub(1); // end of prev line
+        let prev_end = self.line_start(text).saturating_sub(1);
         if prev_end == 0 && self.line_start(text) == 0 { return; }
         let prev_start = text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let prev_len = prev_end - prev_start;
@@ -84,9 +86,18 @@ impl VimEngine {
         self.cursor = i;
     }
 
+    fn page_down(&mut self, text: &str, lines: usize) {
+        for _ in 0..lines { self.move_down(text); }
+    }
+
+    fn page_up(&mut self, text: &str, lines: usize) {
+        for _ in 0..lines { self.move_up(text); }
+    }
+
     fn handle_normal_key(&mut self, key: egui::Key, text: &mut String) -> bool {
         let was_pending_d = self.pending_d;
         self.pending_d = false;
+        if key != egui::Key::G { self.pending_g = false; }
 
         match key {
             egui::Key::H => {
@@ -150,6 +161,14 @@ impl VimEngine {
                 self.mode = VimMode::Insert;
             }
 
+            egui::Key::G => {
+                if self.pending_g {
+                    self.cursor = 0;
+                    self.pending_g = false;
+                } else {
+                    self.pending_g = true;
+                }
+            }
             egui::Key::Semicolon => {
             }
             _ => return false,
@@ -161,6 +180,7 @@ impl VimEngine {
         match c {
             '$' => { self.cursor = self.line_end(text); }
             'A' => { self.cursor = self.line_end(text); self.mode = VimMode::Insert; }
+            'G' => { self.cursor = text.len(); self.pending_g = false; }
             ':' => {
                 self.command_buf.clear();
                 self.status_msg.clear();
@@ -270,7 +290,6 @@ impl EditorApp {
                 std::process::exit(0);
             }
             other if other.starts_with("w ") => {
-                // :w filename — save to a specific path
                 let path = PathBuf::from(other[2..].trim());
                 match fs::write(&path, &self.text) {
                     Ok(_) => {
@@ -355,6 +374,12 @@ impl EditorApp {
                     self.vim.command_buf.clear();
                     self.vim.status_msg.clear();
                     self.vim.mode = VimMode::Command;
+                }
+                egui::Key::F if modifiers.ctrl => {
+                    self.vim.page_down(&self.text.clone(), 20);
+                }
+                egui::Key::B if modifiers.ctrl => {
+                    self.vim.page_up(&self.text.clone(), 20);
                 }
                 other => { self.vim.handle_normal_key(other, &mut self.text); }
             }
@@ -446,6 +471,7 @@ impl eframe::App for EditorApp {
                             ui.label(egui::RichText::new(
                                 "h/j/k/l  w/b word  i insert  a append  A eol  \
                                  o new-line  x del-char  dd del-line  0/$ start/end  \
+                                 Ctrl+F page-down  Ctrl+B page-up  G end-of-file  gg top-of-file  \
                                  :w save  :wq save+quit  :q quit"
                             ).small().weak());
                         }
@@ -488,6 +514,10 @@ impl eframe::App for EditorApp {
                         row(ui, "b", "Jump to start of previous word");
                         row(ui, "0", "Jump to start of line");
                         row(ui, "$", "Jump to end of line");
+                        row(ui, "Ctrl+f", "Page down (20 lines)");
+                        row(ui, "Ctrl+b", "Page up (20 lines)");
+                        row(ui, "G", "Jump to end of file (Shift+G)");
+                        row(ui, "gg", "Jump to top of file (press g twice)");
 
                         section(ui, "Entering Insert Mode");
                         row(ui, "i", "Insert before cursor");
