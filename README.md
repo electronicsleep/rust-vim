@@ -1,3 +1,5 @@
 # rust-vim
 
-Simple rust and vim gui editor
+Simple Rust and Vim GUI Editor
+
+Vim toggle and help for learning
