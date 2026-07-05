@@ -1,0 +1,643 @@
+use eframe::egui;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum VimMode {
+    Normal,
+    Insert,
+    Command,
+}
+
+struct VimEngine {
+    mode: VimMode,
+    cursor: usize,
+    pending_d: bool,
+    command_buf: String,
+    status_msg: String,
+}
+
+impl VimEngine {
+    fn new() -> Self {
+        Self {
+            mode: VimMode::Normal,
+            cursor: 0,
+            pending_d: false,
+            command_buf: String::new(),
+            status_msg: String::new(),
+        }
+    }
+
+    fn clamp(&self, text: &str) -> usize {
+        self.cursor.min(text.len())
+    }
+
+    fn line_start(&self, text: &str) -> usize {
+        let c = self.clamp(text);
+        text[..c].rfind('\n').map(|i| i + 1).unwrap_or(0)
+    }
+
+    fn line_end(&self, text: &str) -> usize {
+        let c = self.clamp(text);
+        text[c..].find('\n').map(|i| c + i).unwrap_or(text.len())
+    }
+
+    fn move_up(&mut self, text: &str) {
+        let c = self.clamp(text);
+        let col = c - self.line_start(text);
+        let prev_end = self.line_start(text).saturating_sub(1); // end of prev line
+        if prev_end == 0 && self.line_start(text) == 0 { return; }
+        let prev_start = text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prev_len = prev_end - prev_start;
+        self.cursor = prev_start + col.min(prev_len);
+    }
+
+    fn move_down(&mut self, text: &str) {
+        let c = self.clamp(text);
+        let col = c - self.line_start(text);
+        let end = self.line_end(text);
+        if end == text.len() { return; }
+        let next_start = end + 1;
+        let next_end = text[next_start..].find('\n')
+            .map(|i| next_start + i)
+            .unwrap_or(text.len());
+        let next_len = next_end - next_start;
+        self.cursor = next_start + col.min(next_len);
+    }
+
+    fn word_forward(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut i = self.clamp(text);
+        while i < bytes.len() && (bytes[i] as char).is_alphanumeric() { i += 1; }
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() { i += 1; }
+        self.cursor = i;
+    }
+
+    fn word_back(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut i = self.clamp(text);
+        if i == 0 { return; }
+        i -= 1;
+        while i > 0 && (bytes[i] as char).is_whitespace() { i -= 1; }
+        while i > 0 && (bytes[i - 1] as char).is_alphanumeric() { i -= 1; }
+        self.cursor = i;
+    }
+
+    fn handle_normal_key(&mut self, key: egui::Key, text: &mut String) -> bool {
+        let was_pending_d = self.pending_d;
+        self.pending_d = false;
+
+        match key {
+            egui::Key::H => {
+                if self.cursor > 0 { self.cursor -= 1; }
+            }
+            egui::Key::L => {
+                let c = self.clamp(text);
+                let end = self.line_end(text);
+                if c < end { self.cursor += 1; }
+            }
+            egui::Key::K => self.move_up(text),
+            egui::Key::J => self.move_down(text),
+            egui::Key::W => self.word_forward(text),
+            egui::Key::B => self.word_back(text),
+
+            egui::Key::Num0 => {
+                self.cursor = self.line_start(text);
+            }
+            egui::Key::Num4 => {
+                self.cursor = self.line_end(text);
+            }
+
+            egui::Key::X => {
+                let c = self.clamp(text);
+                if c < text.len() && text.as_bytes()[c] != b'\n' {
+                    text.remove(c);
+                    self.cursor = self.clamp(text);
+                }
+            }
+
+            egui::Key::D => {
+                if was_pending_d {
+                    let start = self.line_start(text);
+                    let end = self.line_end(text);
+                    if end < text.len() {
+                        text.drain(start..=end);
+                    } else if start > 0 {
+                        text.drain(start - 1..end);
+                    } else {
+                        text.drain(start..end);
+                    }
+                    self.cursor = start.min(text.len());
+                } else {
+                    self.pending_d = true;
+                }
+            }
+
+            egui::Key::I => {
+                self.mode = VimMode::Insert;
+            }
+            egui::Key::A => {
+                let c = self.clamp(text);
+                let end = self.line_end(text);
+                if c < end { self.cursor += 1; }
+                self.mode = VimMode::Insert;
+            }
+            egui::Key::O => {
+                let end = self.line_end(text);
+                text.insert(end, '\n');
+                self.cursor = end + 1;
+                self.mode = VimMode::Insert;
+            }
+
+            egui::Key::Semicolon => {
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn handle_char_normal(&mut self, c: char, text: &mut String) {
+        match c {
+            '$' => { self.cursor = self.line_end(text); }
+            'A' => { self.cursor = self.line_end(text); self.mode = VimMode::Insert; }
+            ':' => {
+                self.command_buf.clear();
+                self.status_msg.clear();
+                self.mode = VimMode::Command;
+            }
+            _ => {}
+        }
+    }
+}
+
+struct EditorApp {
+    text: String,
+    file_path: Option<PathBuf>,
+    dirty: bool,
+    vim_enabled: bool,
+    vim: VimEngine,
+    show_help: bool,
+}
+
+impl Default for EditorApp {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            file_path: None,
+            dirty: false,
+            vim_enabled: false,
+            vim: VimEngine::new(),
+            show_help: false,
+        }
+    }
+}
+
+impl EditorApp {
+    fn from_path(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(p) => match fs::read_to_string(&p) {
+                Ok(content) => Self {
+                    text: content,
+                    file_path: Some(p),
+                    show_help: false,
+                    ..Default::default()
+                },
+                Err(_) => Self {
+                    file_path: Some(p),
+                    show_help: false,
+                    ..Default::default()
+                },
+            },
+            None => Self::default(),
+        }
+    }
+
+    fn open_file(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                self.text = content;
+                self.file_path = Some(path);
+                self.dirty = false;
+                self.vim.cursor = 0;
+            }
+        }
+    }
+
+    fn save_file(&mut self) {
+        if let Some(path) = &self.file_path {
+            if fs::write(path, &self.text).is_ok() {
+                self.dirty = false;
+            }
+        } else {
+            self.save_as();
+        }
+    }
+
+    fn save_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().save_file() {
+            if fs::write(&path, &self.text).is_ok() {
+                self.file_path = Some(path);
+                self.dirty = false;
+            }
+        }
+    }
+
+    fn execute_command(&mut self) {
+        let cmd = self.vim.command_buf.trim().to_string();
+        match cmd.as_str() {
+            "w" => {
+                self.save_file();
+                let name = self.file_path.as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                self.vim.status_msg = format!("\"{}\" written", name);
+            }
+            "w!" => {
+                self.save_file();
+                self.vim.status_msg = "written (forced)".to_string();
+            }
+            "q" => {
+                std::process::exit(0);
+            }
+            "q!" => {
+                std::process::exit(0);
+            }
+            "wq" | "x" => {
+                self.save_file();
+                std::process::exit(0);
+            }
+            other if other.starts_with("w ") => {
+                // :w filename — save to a specific path
+                let path = PathBuf::from(other[2..].trim());
+                match fs::write(&path, &self.text) {
+                    Ok(_) => {
+                        self.vim.status_msg = format!("\"{}\" written", path.display());
+                        self.file_path = Some(path);
+                        self.dirty = false;
+                    }
+                    Err(e) => {
+                        self.vim.status_msg = format!("Error: {}", e);
+                    }
+                }
+            }
+            "help" | "h" => {
+                self.show_help = true;
+            }
+            _ => {
+                self.vim.status_msg = format!("Not a command: {}", cmd);
+            }
+        }
+        self.vim.command_buf.clear();
+        self.vim.mode = VimMode::Normal;
+    }
+
+    fn process_vim_command(&mut self, ctx: &egui::Context) {
+        let mut chars: Vec<char> = vec![];
+        let mut enter = false;
+        let mut esc = false;
+
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Text(t) => {
+                        for c in t.chars() { chars.push(c); }
+                    }
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                        enter = true;
+                    }
+                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                        esc = true;
+                    }
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                        self.vim.command_buf.pop();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        for c in chars { self.vim.command_buf.push(c); }
+
+        if enter {
+            self.execute_command();
+        } else if esc {
+            self.vim.command_buf.clear();
+            self.vim.status_msg.clear();
+            self.vim.mode = VimMode::Normal;
+        }
+    }
+
+    fn process_vim_normal(&mut self, ctx: &egui::Context) {
+        let mut keys: Vec<(egui::Key, egui::Modifiers)> = vec![];
+        let mut chars: Vec<char> = vec![];
+
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        keys.push((*key, *modifiers));
+                    }
+                    egui::Event::Text(t) => {
+                        for c in t.chars() { chars.push(c); }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        for (key, modifiers) in keys {
+            match key {
+                egui::Key::Escape => { self.vim.mode = VimMode::Normal; }
+                egui::Key::Semicolon if modifiers.shift => {
+                    self.vim.command_buf.clear();
+                    self.vim.status_msg.clear();
+                    self.vim.mode = VimMode::Command;
+                }
+                other => { self.vim.handle_normal_key(other, &mut self.text); }
+            }
+        }
+
+        for c in chars {
+            if c == ':' {
+                self.vim.command_buf.clear();
+                self.vim.status_msg.clear();
+                self.vim.mode = VimMode::Command;
+            } else {
+                self.vim.handle_char_normal(c, &mut self.text);
+            }
+        }
+    }
+}
+
+impl eframe::App for EditorApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        ctx.input(|i| {
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::O) { self.open_file(); }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::S) { self.save_file(); }
+        });
+
+        if self.vim_enabled && self.vim.mode == VimMode::Insert {
+            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if esc {
+                self.vim.mode = VimMode::Normal;
+            }
+        }
+
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Open (Ctrl+O)").clicked() { self.open_file(); }
+                if ui.button("Save (Ctrl+S)").clicked() { self.save_file(); }
+                if ui.button("Save As").clicked()       { self.save_as(); }
+
+                ui.separator();
+
+                if ui.button("Help (:help)").clicked() {
+                    self.show_help = true;
+                }
+
+                ui.separator();
+
+                if ui.checkbox(&mut self.vim_enabled, "Vim mode").changed() {
+                    self.vim.mode = VimMode::Normal;
+                    self.vim.cursor = 0;
+                }
+
+                if self.vim_enabled {
+                    let label = match self.vim.mode {
+                        VimMode::Normal => egui::RichText::new("NORMAL")
+                            .color(egui::Color32::from_rgb(100, 200, 100))
+                            .strong(),
+                        VimMode::Insert => egui::RichText::new("INSERT")
+                            .color(egui::Color32::from_rgb(100, 150, 255))
+                            .strong(),
+                        VimMode::Command => egui::RichText::new("COMMAND")
+                            .color(egui::Color32::from_rgb(220, 180, 80))
+                            .strong(),
+                    };
+                    ui.label(label);
+                }
+
+                ui.separator();
+
+                let name = self.file_path.as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Untitled");
+                ui.label(format!("{}{}", name, if self.dirty { " *" } else { "" }));
+            });
+        });
+
+        if self.vim_enabled {
+            egui::TopBottomPanel::bottom("vim_status").show(ctx, |ui| {
+                match self.vim.mode {
+                    VimMode::Command => {
+                        ui.label(egui::RichText::new(
+                            format!(":{}", self.vim.command_buf)
+                        ).monospace());
+                    }
+                    VimMode::Normal => {
+                        if !self.vim.status_msg.is_empty() {
+                            ui.label(egui::RichText::new(&self.vim.status_msg).small());
+                        } else {
+                            ui.label(egui::RichText::new(
+                                "h/j/k/l  w/b word  i insert  a append  A eol  \
+                                 o new-line  x del-char  dd del-line  0/$ start/end  \
+                                 :w save  :wq save+quit  :q quit"
+                            ).small().weak());
+                        }
+                    }
+                    VimMode::Insert => {
+                        ui.label(egui::RichText::new("Type freely — Esc → Normal mode").small().weak());
+                    }
+                }
+            });
+        }
+
+        if self.show_help {
+            egui::Window::new("Vim Command Reference")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+
+                    let section = |ui: &mut egui::Ui, title: &str| {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(title).strong().color(egui::Color32::from_rgb(100, 200, 100)));
+                        ui.separator();
+                    };
+
+                    let row = |ui: &mut egui::Ui, key: &str, desc: &str| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{:10}", key)).monospace().color(egui::Color32::from_rgb(220, 180, 80)));
+                            ui.label(desc);
+                        });
+                    };
+
+                    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                        section(ui, "Movement");
+                        row(ui, "h", "Move left");
+                        row(ui, "l", "Move right");
+                        row(ui, "j", "Move down");
+                        row(ui, "k", "Move up");
+                        row(ui, "w", "Jump to start of next word");
+                        row(ui, "b", "Jump to start of previous word");
+                        row(ui, "0", "Jump to start of line");
+                        row(ui, "$", "Jump to end of line");
+
+                        section(ui, "Entering Insert Mode");
+                        row(ui, "i", "Insert before cursor");
+                        row(ui, "a", "Insert after cursor (append)");
+                        row(ui, "A", "Insert at end of line");
+                        row(ui, "o", "Open new line below and insert");
+                        row(ui, "Esc", "Return to Normal mode");
+
+                        section(ui, "Editing");
+                        row(ui, "x", "Delete character under cursor");
+                        row(ui, "dd", "Delete current line");
+
+                        section(ui, "File Commands  (Normal mode, type : first)");
+                        row(ui, ":w", "Save file");
+                        row(ui, ":w file", "Save to a new filename");
+                        row(ui, ":wq  :x", "Save and quit");
+                        row(ui, ":q", "Quit");
+                        row(ui, ":q!", "Quit without saving");
+                        row(ui, ":help :h", "Show this help window");
+
+                        section(ui, "Tips");
+                        ui.label("Vim has two main modes: Normal and Insert.");
+                        ui.label("You always start in Normal mode.");
+                        ui.label("Press i to start typing, Esc to stop.");
+                        ui.label("Use hjkl to move — arrow keys also work.");
+                        ui.label("Type : to enter a command, Enter to run it.");
+                    });
+
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        self.show_help = false;
+                    }
+                });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.vim_enabled && (self.vim.mode == VimMode::Normal || self.vim.mode == VimMode::Command) {
+                if self.vim.mode == VimMode::Normal {
+                    self.process_vim_normal(ctx);
+                } else if self.vim.mode == VimMode::Command {
+                    self.process_vim_command(ctx);
+                }
+
+                let c = self.vim.cursor.min(self.text.len());
+
+                let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
+                let line_height = 18.0_f32; // matches monospace 14pt + spacing
+                let cursor_y    = cursor_line as f32 * line_height;
+
+                let before = &self.text[..c];
+                let raw_char = self.text[c..].chars().next();
+
+                let (highlight_str, after): (&str, &str) = match raw_char {
+                    None => {
+                        (" ", "")
+                    }
+                    Some('\n') => {
+                        (" ", &self.text[c..])
+                    }
+                    Some(ch) => {
+                        let end = c + ch.len_utf8();
+                        (&self.text[c..end], &self.text[end..])
+                    }
+                };
+
+                let mono = egui::FontId::monospace(14.0);
+                let text_color = ui.visuals().text_color();
+
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = f32::INFINITY;
+
+                job.append(before, 0.0, egui::TextFormat {
+                    font_id: mono.clone(),
+                    color: text_color,
+                    ..Default::default()
+                });
+                job.append(highlight_str, 0.0, egui::TextFormat {
+                    font_id: mono.clone(),
+                    color: egui::Color32::BLACK,
+                    background: egui::Color32::from_rgb(130, 200, 130),
+                    ..Default::default()
+                });
+                job.append(after, 0.0, egui::TextFormat {
+                    font_id: mono.clone(),
+                    color: text_color,
+                    ..Default::default()
+                });
+
+                egui::ScrollArea::both()
+                    .show(ui, |ui: &mut egui::Ui| {
+                        let label_rect = ui.label(job).rect;
+                        let cursor_rect = egui::Rect::from_min_size(
+                            egui::pos2(label_rect.min.x, label_rect.min.y + cursor_y),
+                            egui::vec2(label_rect.width().max(1.0), line_height),
+                        );
+                        ui.scroll_to_rect(cursor_rect, Some(egui::Align::Center));
+                    });
+
+            } else {
+                let te_id = ui.make_persistent_id("main_text_edit");
+
+                if self.vim_enabled && self.vim.mode == VimMode::Insert {
+                    let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
+                        .chars()
+                        .count();
+                    let mut state = egui::TextEdit::load_state(ui.ctx(), te_id)
+                        .unwrap_or_default();
+                    let mut ccursor = egui::text::CCursor::new(char_idx);
+                    ccursor.prefer_next_row = false;
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                    egui::TextEdit::store_state(ui.ctx(), te_id, state);
+                }
+
+                let te = egui::TextEdit::multiline(&mut self.text)
+                    .id(te_id)
+                    .font(egui::TextStyle::Monospace)
+                    .code_editor()
+                    .desired_width(f32::INFINITY);
+
+                let output = ui.add_sized(ui.available_size(), te);
+
+                if output.changed() {
+                    self.dirty = true;
+                }
+
+                if self.vim_enabled && self.vim.mode == VimMode::Insert {
+                    if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                        if let Some(range) = state.cursor.char_range() {
+                            self.vim.cursor = self.text
+                                .char_indices()
+                                .nth(range.primary.index)
+                                .map(|(i, _)| i)
+                                .unwrap_or(self.text.len());
+                        }
+                    }
+                    output.request_focus();
+                }
+            }
+        });
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let path = args.get(1).map(PathBuf::from);
+
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Text Editor",
+        options,
+        Box::new(|_cc| Ok(Box::new(EditorApp::from_path(path)))),
+    )
+}

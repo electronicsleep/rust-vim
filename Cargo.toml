@@ -1,0 +1,8 @@
+[package]
+name = "rust-vim"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+rfd = "0.15"
