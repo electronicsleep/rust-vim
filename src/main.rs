@@ -397,6 +397,186 @@ impl EditorApp {
     }
 }
 
+
+// Syntax highlighting
+
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
+    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
+    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
+const TYPES: &[&str] = &[
+    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128",
+    "isize", "str", "String", "u8", "u16", "u32", "u64", "u128", "usize",
+    "Vec", "Option", "Result", "Box", "Rc", "Arc", "HashMap", "HashSet",
+];
+
+#[derive(Clone, Copy)]
+enum Token<'a> {
+    Keyword(&'a str),
+    Type_(&'a str),
+    Comment(&'a str),
+    StringLit(&'a str),
+    Number(&'a str),
+    Normal(&'a str),
+}
+
+fn tokenize(text: &str) -> Vec<Token<'_>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+
+    while i < text.len() {
+        if bytes[i] == b'/' && i + 1 < text.len() && bytes[i + 1] == b'/' {
+            let end = text[i..].find('\n').map(|n| i + n).unwrap_or(text.len());
+            tokens.push(Token::Comment(&text[i..end]));
+            i = end;
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            let mut j = i + 1;
+            while j < text.len() {
+                if bytes[j] == b'\\' { j += 2; continue; }
+                if bytes[j] == b'"' { j += 1; break; }
+                j += 1;
+            }
+            tokens.push(Token::StringLit(&text[i..j]));
+            i = j;
+            continue;
+        }
+
+        if bytes[i].is_ascii_digit() {
+            let end = text[i..].find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+                .map(|n| i + n).unwrap_or(text.len());
+            tokens.push(Token::Number(&text[i..end]));
+            i = end;
+            continue;
+        }
+
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let end = text[i..].find(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|n| i + n).unwrap_or(text.len());
+            let word = &text[i..end];
+            if KEYWORDS.contains(&word) {
+                tokens.push(Token::Keyword(word));
+            } else if TYPES.contains(&word) {
+                tokens.push(Token::Type_(word));
+            } else {
+                tokens.push(Token::Normal(word));
+            }
+            i = end;
+            continue;
+        }
+
+        let char_end = text[i..].char_indices().nth(1).map(|(n, _)| i + n).unwrap_or(text.len());
+        tokens.push(Token::Normal(&text[i..char_end]));
+        i = char_end;
+    }
+
+    tokens
+}
+
+fn build_highlight_job(
+    text: &str,
+    cursor_byte: Option<usize>,
+    text_color: egui::Color32,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let mono   = egui::FontId::monospace(14.0);
+    let kw     = egui::Color32::from_rgb(204, 120, 180); // purple  — keywords
+    let ty     = egui::Color32::from_rgb(86,  182, 194); // cyan    — types
+    let comm   = egui::Color32::from_rgb(128, 128, 128); // grey    — comments
+    let string = egui::Color32::from_rgb(152, 195, 121); // green   — strings
+    let number = egui::Color32::from_rgb(209, 154,  84); // orange  — numbers
+    let cursor_bg = egui::Color32::from_rgb(130, 200, 130);
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+
+    let fmt = |color: egui::Color32| egui::TextFormat {
+        font_id: mono.clone(),
+        color,
+        ..Default::default()
+    };
+
+    let tokens = tokenize(text);
+
+    let mut spans: Vec<(usize, &str, egui::Color32)> = Vec::new();
+    let mut pos = 0usize;
+    for token in &tokens {
+        let (s, color) = match token {
+            Token::Keyword(s)   => (*s, kw),
+            Token::Type_(s)     => (*s, ty),
+            Token::Comment(s)   => (*s, comm),
+            Token::StringLit(s) => (*s, string),
+            Token::Number(s)    => (*s, number),
+            Token::Normal(s)    => (*s, text_color),
+        };
+        spans.push((pos, s, color));
+        pos += s.len();
+    }
+
+    match cursor_byte {
+        None => {
+            for (_, s, color) in spans {
+                job.append(s, 0.0, fmt(color));
+            }
+        }
+        Some(cursor) => {
+            for (span_start, s, color) in spans {
+                let span_end = span_start + s.len();
+
+                if cursor >= span_end || cursor < span_start {
+                    job.append(s, 0.0, fmt(color));
+                } else {
+                    let rel = cursor - span_start;
+                    let before = &s[..rel];
+                    let raw_ch = s[rel..].chars().next();
+
+                    if !before.is_empty() {
+                        job.append(before, 0.0, fmt(color));
+                    }
+
+                    match raw_ch {
+                        None | Some('\n') => {
+                            job.append(" ", 0.0, egui::TextFormat {
+                                font_id: mono.clone(),
+                                color: egui::Color32::BLACK,
+                                background: cursor_bg,
+                                ..Default::default()
+                            });
+                            let after_start = rel + raw_ch.map(|c| c.len_utf8()).unwrap_or(0);
+                            if after_start < s.len() {
+                                job.append(&s[rel..], 0.0, fmt(color));
+                            } else if raw_ch == Some('\n') {
+                                job.append("\n", 0.0, fmt(color));
+                            }
+                        }
+                        Some(ch) => {
+                            let ch_end = rel + ch.len_utf8();
+                            job.append(&s[rel..ch_end], 0.0, egui::TextFormat {
+                                font_id: mono.clone(),
+                                color: egui::Color32::BLACK,
+                                background: cursor_bg,
+                                ..Default::default()
+                            });
+                            if ch_end < s.len() {
+                                job.append(&s[ch_end..], 0.0, fmt(color));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    job
+}
+
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
@@ -564,49 +744,14 @@ impl eframe::App for EditorApp {
                 let c = self.vim.cursor.min(self.text.len());
 
                 let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
-                let line_height = 18.0_f32; // matches monospace 14pt + spacing
+                let line_height = 18.0_f32;
                 let cursor_y    = cursor_line as f32 * line_height;
 
-                let before = &self.text[..c];
-                let raw_char = self.text[c..].chars().next();
-
-                let (highlight_str, after): (&str, &str) = match raw_char {
-                    None => {
-                        (" ", "")
-                    }
-                    Some('\n') => {
-                        (" ", &self.text[c..])
-                    }
-                    Some(ch) => {
-                        let end = c + ch.len_utf8();
-                        (&self.text[c..end], &self.text[end..])
-                    }
-                };
-
-                let mono = egui::FontId::monospace(14.0);
                 let text_color = ui.visuals().text_color();
+                let wrap_width = ui.available_width();
+                let job = build_highlight_job(&self.text, Some(c), text_color, wrap_width);
 
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-
-                job.append(before, 0.0, egui::TextFormat {
-                    font_id: mono.clone(),
-                    color: text_color,
-                    ..Default::default()
-                });
-                job.append(highlight_str, 0.0, egui::TextFormat {
-                    font_id: mono.clone(),
-                    color: egui::Color32::BLACK,
-                    background: egui::Color32::from_rgb(130, 200, 130),
-                    ..Default::default()
-                });
-                job.append(after, 0.0, egui::TextFormat {
-                    font_id: mono.clone(),
-                    color: text_color,
-                    ..Default::default()
-                });
-
-                egui::ScrollArea::both()
+                egui::ScrollArea::vertical()
                     .show(ui, |ui: &mut egui::Ui| {
                         let label_rect = ui.label(job).rect;
                         let cursor_rect = egui::Rect::from_min_size(
@@ -631,30 +776,43 @@ impl eframe::App for EditorApp {
                     egui::TextEdit::store_state(ui.ctx(), te_id, state);
                 }
 
-                let te = egui::TextEdit::multiline(&mut self.text)
-                    .id(te_id)
-                    .font(egui::TextStyle::Monospace)
-                    .code_editor()
-                    .desired_width(f32::INFINITY);
+                let text_color = ui.visuals().text_color();
+                let available_width = ui.available_width();
+                let mut layouter = move |ui: &egui::Ui, string: &str, _wrap: f32| {
+                    let job = build_highlight_job(string, None, text_color, available_width);
+                    ui.fonts(|f| f.layout_job(job))
+                };
 
-                let output = ui.add_sized(ui.available_size(), te);
+                egui::ScrollArea::vertical()
+                    .id_salt("insert_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let te = egui::TextEdit::multiline(&mut self.text)
+                            .id(te_id)
+                            .font(egui::TextStyle::Monospace)
+                            .layouter(&mut layouter)
+                            .desired_width(available_width)
+                            .desired_rows(40);
 
-                if output.changed() {
-                    self.dirty = true;
-                }
+                        let output = ui.add(te);
 
-                if self.vim_enabled && self.vim.mode == VimMode::Insert {
-                    if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
-                        if let Some(range) = state.cursor.char_range() {
-                            self.vim.cursor = self.text
-                                .char_indices()
-                                .nth(range.primary.index)
-                                .map(|(i, _)| i)
-                                .unwrap_or(self.text.len());
+                        if output.changed() {
+                            self.dirty = true;
                         }
-                    }
-                    output.request_focus();
-                }
+
+                        if self.vim_enabled && self.vim.mode == VimMode::Insert {
+                            if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                                if let Some(range) = state.cursor.char_range() {
+                                    self.vim.cursor = self.text
+                                        .char_indices()
+                                        .nth(range.primary.index)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(self.text.len());
+                                }
+                            }
+                            output.request_focus();
+                        }
+                    });
             }
         });
     }
