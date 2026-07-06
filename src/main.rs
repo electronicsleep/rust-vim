@@ -581,8 +581,9 @@ impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
         ctx.input(|i| {
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::O) { self.open_file(); }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::S) { self.save_file(); }
+            let cmd_or_ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if cmd_or_ctrl && i.key_pressed(egui::Key::O) { self.open_file(); }
+            if cmd_or_ctrl && i.key_pressed(egui::Key::S) { self.save_file(); }
         });
 
         if self.vim_enabled && self.vim.mode == VimMode::Insert {
@@ -594,8 +595,8 @@ impl eframe::App for EditorApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open (Ctrl+O)").clicked() { self.open_file(); }
-                if ui.button("Save (Ctrl+S)").clicked() { self.save_file(); }
+                if ui.button("Open (Cmd/Ctrl+O)").clicked() { self.open_file(); }
+                if ui.button("Save (Cmd/Ctrl+S)").clicked() { self.save_file(); }
                 if ui.button("Save As").clicked()       { self.save_as(); }
 
                 ui.separator();
@@ -608,7 +609,17 @@ impl eframe::App for EditorApp {
 
                 if ui.checkbox(&mut self.vim_enabled, "Vim mode").changed() {
                     self.vim.mode = VimMode::Normal;
-                    self.vim.cursor = 0;
+                    if !self.vim_enabled {
+                        let te_id = ui.make_persistent_id("main_text_edit");
+                        let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
+                            .chars().count();
+                        let mut state = egui::TextEdit::load_state(ui.ctx(), te_id)
+                            .unwrap_or_default();
+                        let mut ccursor = egui::text::CCursor::new(char_idx);
+                        ccursor.prefer_next_row = false;
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                        egui::TextEdit::store_state(ui.ctx(), te_id, state);
+                    }
                 }
 
                 if self.vim_enabled {
@@ -744,7 +755,7 @@ impl eframe::App for EditorApp {
                 let c = self.vim.cursor.min(self.text.len());
 
                 let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
-                let line_height = 18.0_f32;
+                let line_height = 18.0_f32; // matches monospace 14pt + spacing
                 let cursor_y    = cursor_line as f32 * line_height;
 
                 let text_color = ui.visuals().text_color();
@@ -800,16 +811,17 @@ impl eframe::App for EditorApp {
                             self.dirty = true;
                         }
 
-                        if self.vim_enabled && self.vim.mode == VimMode::Insert {
-                            if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
-                                if let Some(range) = state.cursor.char_range() {
-                                    self.vim.cursor = self.text
-                                        .char_indices()
-                                        .nth(range.primary.index)
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(self.text.len());
-                                }
+                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                            if let Some(range) = state.cursor.char_range() {
+                                self.vim.cursor = self.text
+                                    .char_indices()
+                                    .nth(range.primary.index)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(self.text.len());
                             }
+                        }
+
+                        if self.vim_enabled && self.vim.mode == VimMode::Insert {
                             output.request_focus();
                         }
                     });
