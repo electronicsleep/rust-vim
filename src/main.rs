@@ -101,6 +101,7 @@ impl VimEngine {
         while i < len && class(bytes[i]) == 0 {
             i += 1;
         }
+
         self.cursor = i;
     }
 
@@ -641,12 +642,14 @@ fn build_highlight_job(
             }
         }
         Some(cursor) => {
+            let mut cursor_drawn = false;
             for (span_start, s, color) in spans {
                 let span_end = span_start + s.len();
 
                 if cursor >= span_end || cursor < span_start {
                     job.append(s, 0.0, fmt(color));
                 } else {
+                    cursor_drawn = true;
                     let rel = cursor - span_start;
                     let before = &s[..rel];
                     let raw_ch = s[rel..].chars().next();
@@ -692,6 +695,19 @@ fn build_highlight_job(
                         }
                     }
                 }
+            }
+
+            if !cursor_drawn {
+                job.append(
+                    " ",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color: egui::Color32::BLACK,
+                        background: cursor_bg,
+                        ..Default::default()
+                    },
+                );
             }
         }
     }
@@ -925,10 +941,9 @@ impl eframe::App for EditorApp {
                 let cursor_y = cursor_line as f32 * line_height;
 
                 if cursor_moved {
-                    let max_offset = (self.text_h - viewport_h).max(0.0);
+                    let max_offset = (self.text_h - viewport_h + line_height).max(0.0);
                     let cursor_center = cursor_y + line_height / 2.0;
-                    let mut offset = cursor_center - viewport_h / 2.0;
-                    offset = offset.clamp(0.0, max_offset);
+                    let offset = (cursor_center - viewport_h / 2.0).clamp(0.0, max_offset);
                     self.scroll_offset = offset;
                 }
 
@@ -937,6 +952,7 @@ impl eframe::App for EditorApp {
                     .show(ui, |ui: &mut egui::Ui| {
                         let text_rect = ui.label(job).rect;
                         self.text_h = text_rect.height();
+                        ui.add_space(line_height);
                     });
 
                 if !cursor_moved {
