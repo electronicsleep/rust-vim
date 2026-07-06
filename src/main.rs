@@ -785,14 +785,21 @@ impl eframe::App for EditorApp {
 
                 let size = ui.available_size();
                 let text_color = ui.visuals().text_color();
-                let mut layouter = move |ui: &egui::Ui, s: &str, wrap: f32| {
-                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap)))
+                let mut layouter = move |ui: &egui::Ui, s: &str, _wrap: f32| {
+                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, size.x)))
                 };
 
-                let output = ui.add_sized(size, egui::TextEdit::multiline(&mut self.text)
-                    .id(te_id)
-                    .font(egui::TextStyle::Monospace)
-                    .layouter(&mut layouter));
+                let output = egui::ScrollArea::vertical()
+                    .id_salt("editor_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut self.text)
+                            .id(te_id)
+                            .font(egui::TextStyle::Monospace)
+                            .layouter(&mut layouter)
+                            .desired_width(size.x)
+                            .frame(false))
+                    }).inner;
 
                 if output.changed() { self.dirty = true; }
 
