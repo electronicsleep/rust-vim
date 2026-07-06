@@ -198,6 +198,9 @@ struct EditorApp {
     vim_enabled: bool,
     vim: VimEngine,
     show_help: bool,
+    last_cursor: usize,
+    scroll_offset: f32,
+    text_h: f32,
 }
 
 impl Default for EditorApp {
@@ -209,6 +212,9 @@ impl Default for EditorApp {
             vim_enabled: false,
             vim: VimEngine::new(),
             show_help: false,
+            last_cursor: usize::MAX,
+            scroll_offset: 0.0,
+            text_h: 0.0,
         }
     }
 }
@@ -752,22 +758,40 @@ impl eframe::App for EditorApp {
                 let c = self.vim.cursor.min(self.text.len());
 
                 let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
-                let line_height = 18.0_f32;
-                let cursor_y    = cursor_line as f32 * line_height;
+                let total_lines = self.text.chars().filter(|&ch| ch == '\n').count() + 1;
 
                 let text_color = ui.visuals().text_color();
                 let wrap_width = ui.available_width();
                 let job = build_highlight_job(&self.text, Some(c), text_color, wrap_width);
 
-                egui::ScrollArea::vertical()
+                let cursor_moved = self.vim.cursor != self.last_cursor;
+                self.last_cursor = self.vim.cursor;
+
+                let viewport_h = ui.available_height();
+
+                let line_height = if self.text_h > 0.0 && total_lines > 0 {
+                    self.text_h / total_lines as f32
+                } else {
+                    ui.text_style_height(&egui::TextStyle::Monospace)
+                };
+                let cursor_y = cursor_line as f32 * line_height;
+
+                if cursor_moved {
+                    let max_offset = (self.text_h - viewport_h + line_height).max(0.0);
+                    let cursor_center = cursor_y + line_height / 2.0;
+                    let mut offset = cursor_center - viewport_h / 2.0;
+                    offset = offset.clamp(0.0, max_offset);
+                    self.scroll_offset = offset;
+                }
+
+                let out = egui::ScrollArea::vertical()
+                    .vertical_scroll_offset(self.scroll_offset)
                     .show(ui, |ui: &mut egui::Ui| {
-                        let label_rect = ui.label(job).rect;
-                        let cursor_rect = egui::Rect::from_min_size(
-                            egui::pos2(label_rect.min.x, label_rect.min.y + cursor_y),
-                            egui::vec2(label_rect.width().max(1.0), line_height),
-                        );
-                        ui.scroll_to_rect(cursor_rect, Some(egui::Align::Center));
+                        let text_rect = ui.label(job).rect;
+                        self.text_h = text_rect.height();
                     });
+
+                self.scroll_offset = out.state.offset.y;
 
             } else {
                 let te_id = ui.make_persistent_id("main_text_edit");
