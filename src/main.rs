@@ -794,16 +794,19 @@ impl eframe::App for EditorApp {
                     ui.fonts(|f| f.layout_job(job))
                 };
 
+                let available_size = ui.available_size();
+
                 egui::ScrollArea::vertical()
                     .id_salt("insert_scroll")
+                    .max_height(available_size.y)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let te = egui::TextEdit::multiline(&mut self.text)
                             .id(te_id)
                             .font(egui::TextStyle::Monospace)
                             .layouter(&mut layouter)
-                            .desired_width(available_width)
-                            .desired_rows(40);
+                            .desired_width(available_size.x)
+                            .min_size(egui::vec2(available_size.x, available_size.y));
 
                         let output = ui.add(te);
 
