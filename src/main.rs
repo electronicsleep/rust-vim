@@ -777,7 +777,7 @@ impl eframe::App for EditorApp {
                 let cursor_y = cursor_line as f32 * line_height;
 
                 if cursor_moved {
-                    let max_offset = (self.text_h - viewport_h + line_height).max(0.0);
+                    let max_offset = (self.text_h - viewport_h).max(0.0);
                     let cursor_center = cursor_y + line_height / 2.0;
                     let mut offset = cursor_center - viewport_h / 2.0;
                     offset = offset.clamp(0.0, max_offset);
@@ -791,7 +791,9 @@ impl eframe::App for EditorApp {
                         self.text_h = text_rect.height();
                     });
 
-                self.scroll_offset = out.state.offset.y;
+                if !cursor_moved {
+                    self.scroll_offset = out.state.offset.y;
+                }
 
             } else {
                 let te_id = ui.make_persistent_id("main_text_edit");
