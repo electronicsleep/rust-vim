@@ -397,9 +397,6 @@ impl EditorApp {
     }
 }
 
-
-// Syntax highlighting
-
 const KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn",
     "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
@@ -487,11 +484,11 @@ fn build_highlight_job(
     wrap_width: f32,
 ) -> egui::text::LayoutJob {
     let mono   = egui::FontId::monospace(14.0);
-    let kw     = egui::Color32::from_rgb(204, 120, 180); // purple  — keywords
-    let ty     = egui::Color32::from_rgb(86,  182, 194); // cyan    — types
-    let comm   = egui::Color32::from_rgb(128, 128, 128); // grey    — comments
-    let string = egui::Color32::from_rgb(152, 195, 121); // green   — strings
-    let number = egui::Color32::from_rgb(209, 154,  84); // orange  — numbers
+    let kw     = egui::Color32::from_rgb(204, 120, 180);
+    let ty     = egui::Color32::from_rgb(86,  182, 194);
+    let comm   = egui::Color32::from_rgb(128, 128, 128);
+    let string = egui::Color32::from_rgb(152, 195, 121);
+    let number = egui::Color32::from_rgb(209, 154,  84);
     let cursor_bg = egui::Color32::from_rgb(130, 200, 130);
 
     let mut job = egui::text::LayoutJob::default();
@@ -755,7 +752,7 @@ impl eframe::App for EditorApp {
                 let c = self.vim.cursor.min(self.text.len());
 
                 let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
-                let line_height = 18.0_f32; // matches monospace 14pt + spacing
+                let line_height = 18.0_f32;
                 let cursor_y    = cursor_line as f32 * line_height;
 
                 let text_color = ui.visuals().text_color();
@@ -777,8 +774,7 @@ impl eframe::App for EditorApp {
 
                 if self.vim_enabled && self.vim.mode == VimMode::Insert {
                     let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
-                        .chars()
-                        .count();
+                        .chars().count();
                     let mut state = egui::TextEdit::load_state(ui.ctx(), te_id)
                         .unwrap_or_default();
                     let mut ccursor = egui::text::CCursor::new(char_idx);
@@ -787,47 +783,32 @@ impl eframe::App for EditorApp {
                     egui::TextEdit::store_state(ui.ctx(), te_id, state);
                 }
 
+                let size = ui.available_size();
                 let text_color = ui.visuals().text_color();
-                let available_width = ui.available_width();
-                let mut layouter = move |ui: &egui::Ui, string: &str, _wrap: f32| {
-                    let job = build_highlight_job(string, None, text_color, available_width);
-                    ui.fonts(|f| f.layout_job(job))
+                let mut layouter = move |ui: &egui::Ui, s: &str, wrap: f32| {
+                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap)))
                 };
 
-                let available_size = ui.available_size();
+                let output = ui.add_sized(size, egui::TextEdit::multiline(&mut self.text)
+                    .id(te_id)
+                    .font(egui::TextStyle::Monospace)
+                    .layouter(&mut layouter));
 
-                egui::ScrollArea::vertical()
-                    .id_salt("insert_scroll")
-                    .max_height(available_size.y)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let te = egui::TextEdit::multiline(&mut self.text)
-                            .id(te_id)
-                            .font(egui::TextStyle::Monospace)
-                            .layouter(&mut layouter)
-                            .desired_width(available_size.x)
-                            .min_size(egui::vec2(available_size.x, available_size.y));
+                if output.changed() { self.dirty = true; }
 
-                        let output = ui.add(te);
+                if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                    if let Some(range) = state.cursor.char_range() {
+                        self.vim.cursor = self.text
+                            .char_indices()
+                            .nth(range.primary.index)
+                            .map(|(i, _)| i)
+                            .unwrap_or(self.text.len());
+                    }
+                }
 
-                        if output.changed() {
-                            self.dirty = true;
-                        }
-
-                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
-                            if let Some(range) = state.cursor.char_range() {
-                                self.vim.cursor = self.text
-                                    .char_indices()
-                                    .nth(range.primary.index)
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(self.text.len());
-                            }
-                        }
-
-                        if self.vim_enabled && self.vim.mode == VimMode::Insert {
-                            output.request_focus();
-                        }
-                    });
+                if self.vim_enabled && self.vim.mode == VimMode::Insert {
+                    output.request_focus();
+                }
             }
         });
     }
