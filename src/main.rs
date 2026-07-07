@@ -8,6 +8,7 @@ enum VimMode {
     Normal,
     Insert,
     Command,
+    Search,
 }
 
 struct VimEngine {
@@ -17,6 +18,8 @@ struct VimEngine {
     pending_g: bool,
     command_buf: String,
     status_msg: String,
+    search_buf: String,
+    last_search: String,
 }
 
 impl VimEngine {
@@ -28,6 +31,8 @@ impl VimEngine {
             pending_g: false,
             command_buf: String::new(),
             status_msg: String::new(),
+            search_buf: String::new(),
+            last_search: String::new(),
         }
     }
 
@@ -135,6 +140,39 @@ impl VimEngine {
         }
 
         self.cursor = i;
+    }
+
+    fn search_next(&mut self, text: &str) {
+        if self.last_search.is_empty() {
+            return;
+        }
+        let start = self.clamp(text);
+        let from = (start + 1).min(text.len());
+        if let Some(pos) = text[from..].find(&self.last_search) {
+            self.cursor = from + pos;
+            self.status_msg = format!("/{}", self.last_search);
+        } else if let Some(pos) = text.find(&self.last_search) {
+            self.cursor = pos;
+            self.status_msg = format!("/{} (wrapped)", self.last_search);
+        } else {
+            self.status_msg = format!("Pattern not found: {}", self.last_search);
+        }
+    }
+
+    fn search_prev(&mut self, text: &str) {
+        if self.last_search.is_empty() {
+            return;
+        }
+        let start = self.clamp(text);
+        if let Some(pos) = text[..start].rfind(&self.last_search) {
+            self.cursor = pos;
+            self.status_msg = format!("?{}", self.last_search);
+        } else if let Some(pos) = text.rfind(&self.last_search) {
+            self.cursor = pos;
+            self.status_msg = format!("?{} (wrapped)", self.last_search);
+        } else {
+            self.status_msg = format!("Pattern not found: {}", self.last_search);
+        }
     }
 
     fn page_down(&mut self, text: &str, lines: usize) {
@@ -256,6 +294,11 @@ impl VimEngine {
                 self.status_msg.clear();
                 self.mode = VimMode::Command;
             }
+            '/' => {
+                self.search_buf.clear();
+                self.status_msg.clear();
+                self.mode = VimMode::Search;
+            }
             _ => {}
         }
     }
@@ -271,6 +314,9 @@ struct EditorApp {
     last_cursor: usize,
     scroll_offset: f32,
     text_h: f32,
+    pending_open: bool,
+    pending_save: bool,
+    pending_save_as: bool,
 }
 
 impl Default for EditorApp {
@@ -285,6 +331,9 @@ impl Default for EditorApp {
             last_cursor: usize::MAX,
             scroll_offset: 0.0,
             text_h: 0.0,
+            pending_open: false,
+            pending_save: false,
+            pending_save_as: false,
         }
     }
 }
@@ -343,19 +392,27 @@ impl EditorApp {
         let cmd = self.vim.command_buf.trim().to_string();
         match cmd.as_str() {
             "w" => {
-                self.save_file();
-                let name = self
-                    .file_path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file")
-                    .to_string();
-                self.vim.status_msg = format!("\"{}\" written", name);
+                if self.file_path.is_some() {
+                    self.save_file();
+                    let name = self
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    self.vim.status_msg = format!("\"{}\" written", name);
+                } else {
+                    self.pending_save_as = true;
+                }
             }
             "w!" => {
-                self.save_file();
-                self.vim.status_msg = "written (forced)".to_string();
+                if self.file_path.is_some() {
+                    self.save_file();
+                    self.vim.status_msg = "written (forced)".to_string();
+                } else {
+                    self.pending_save_as = true;
+                }
             }
             "q" => {
                 std::process::exit(0);
@@ -443,6 +500,61 @@ impl EditorApp {
         }
     }
 
+    fn process_vim_search(&mut self, ctx: &egui::Context) {
+        let mut chars: Vec<char> = vec![];
+        let mut enter = false;
+        let mut esc = false;
+
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Text(t) => {
+                        for c in t.chars() {
+                            chars.push(c);
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    } => {
+                        enter = true;
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    } => {
+                        esc = true;
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        self.vim.search_buf.pop();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        for c in chars {
+            self.vim.search_buf.push(c);
+        }
+
+        if enter {
+            self.vim.last_search = self.vim.search_buf.clone();
+            let text = self.text.clone();
+            self.vim.search_next(&text);
+            self.vim.mode = VimMode::Normal;
+        } else if esc {
+            self.vim.search_buf.clear();
+            self.vim.status_msg.clear();
+            self.vim.mode = VimMode::Normal;
+        }
+    }
+
     fn process_vim_normal(&mut self, ctx: &egui::Context) {
         let mut keys: Vec<(egui::Key, egui::Modifiers)> = vec![];
         let mut chars: Vec<char> = vec![];
@@ -483,6 +595,14 @@ impl EditorApp {
                 }
                 egui::Key::B if modifiers.ctrl => {
                     self.vim.page_up(&self.text.clone(), 20);
+                }
+                egui::Key::N => {
+                    let text = self.text.clone();
+                    if modifiers.shift {
+                        self.vim.search_prev(&text);
+                    } else {
+                        self.vim.search_next(&text);
+                    }
                 }
                 other => {
                     self.vim.handle_normal_key(other, &mut self.text);
@@ -720,10 +840,10 @@ impl eframe::App for EditorApp {
         ctx.input(|i| {
             let cmd_or_ctrl = i.modifiers.ctrl || i.modifiers.command;
             if cmd_or_ctrl && i.key_pressed(egui::Key::O) {
-                self.open_file();
+                self.pending_open = true;
             }
             if cmd_or_ctrl && i.key_pressed(egui::Key::S) {
-                self.save_file();
+                self.pending_save = true;
             }
         });
 
@@ -737,13 +857,13 @@ impl eframe::App for EditorApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open (Cmd/Ctrl+O)").clicked() {
-                    self.open_file();
+                    self.pending_open = true;
                 }
                 if ui.button("Save (Cmd/Ctrl+S)").clicked() {
-                    self.save_file();
+                    self.pending_save = true;
                 }
                 if ui.button("Save As").clicked() {
-                    self.save_as();
+                    self.pending_save_as = true;
                 }
 
                 ui.separator();
@@ -783,6 +903,9 @@ impl eframe::App for EditorApp {
                         VimMode::Command => egui::RichText::new("COMMAND")
                             .color(egui::Color32::from_rgb(220, 180, 80))
                             .strong(),
+                        VimMode::Search => egui::RichText::new("SEARCH")
+                            .color(egui::Color32::from_rgb(200, 140, 220))
+                            .strong(),
                     };
                     ui.label(label);
                 }
@@ -804,26 +927,29 @@ impl eframe::App for EditorApp {
                 VimMode::Command => {
                     ui.label(egui::RichText::new(format!(":{}", self.vim.command_buf)).monospace());
                 }
+                VimMode::Search => {
+                    ui.label(egui::RichText::new(format!("/{}", self.vim.search_buf)).monospace());
+                }
                 VimMode::Normal => {
                     if !self.vim.status_msg.is_empty() {
-                        ui.label(egui::RichText::new(&self.vim.status_msg).small());
+                        ui.label(egui::RichText::new(&self.vim.status_msg).size(18.0));
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "h/j/k/l  w/b word  i insert  a append  A eol  \
-                                 o new-line  x del-char  dd del-line  0/$ start/end  \
-                                 Ctrl+F page-down  Ctrl+B page-up  G end-of-file  gg top-of-file  \
-                                 :w save  :wq save+quit  :q quit",
+                                "move: (h/j/k/l) word: (w/b) insert: (i) append: (a) end-of-line (A) \
+                                 new-line: (o) del-char: (x) del-line: (dd) start/end: (0/$)\n\
+                                 page-down: (Ctrl+F) page-up: (Ctrl+B) end-of-file: (G) top-of-file: (gg) \
+                                 /search n/N save: (:w) save-quit: (:wq) quit: (:q)",
                             )
-                            .small()
+                            .size(18.0)
                             .weak(),
                         );
                     }
                 }
                 VimMode::Insert => {
                     ui.label(
-                        egui::RichText::new("Type freely — Esc → Normal mode")
-                            .small()
+                        egui::RichText::new("Insert Mode: Esc for Normal Mode")
+                            .size(18.0)
                             .weak(),
                     );
                 }
@@ -886,6 +1012,11 @@ impl eframe::App for EditorApp {
                             row(ui, "x", "Delete character under cursor");
                             row(ui, "dd", "Delete current line");
 
+                            section(ui, "Search  (Normal mode)");
+                            row(ui, "/text", "Search forward for text, Enter to jump");
+                            row(ui, "n", "Jump to next match");
+                            row(ui, "N", "Jump to previous match");
+
                             section(ui, "File Commands  (Normal mode, type : first)");
                             row(ui, ":w", "Save file");
                             row(ui, ":w file", "Save to a new filename");
@@ -911,12 +1042,16 @@ impl eframe::App for EditorApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.vim_enabled
-                && (self.vim.mode == VimMode::Normal || self.vim.mode == VimMode::Command)
+                && (self.vim.mode == VimMode::Normal
+                    || self.vim.mode == VimMode::Command
+                    || self.vim.mode == VimMode::Search)
             {
                 if self.vim.mode == VimMode::Normal {
                     self.process_vim_normal(ctx);
                 } else if self.vim.mode == VimMode::Command {
                     self.process_vim_command(ctx);
+                } else if self.vim.mode == VimMode::Search {
+                    self.process_vim_search(ctx);
                 }
 
                 let c = self.vim.cursor.min(self.text.len());
@@ -948,8 +1083,10 @@ impl eframe::App for EditorApp {
                 }
 
                 let out = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .vertical_scroll_offset(self.scroll_offset)
                     .show(ui, |ui: &mut egui::Ui| {
+                        ui.set_min_width(ui.available_width());
                         let text_rect = ui.label(job).rect;
                         self.text_h = text_rect.height();
                         ui.add_space(line_height);
@@ -976,20 +1113,22 @@ impl eframe::App for EditorApp {
 
                 let size = ui.available_size();
                 let text_color = ui.visuals().text_color();
+                let wrap_w = size.x;
                 let mut layouter = move |ui: &egui::Ui, s: &str, _wrap: f32| {
-                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, size.x)))
+                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap_w)))
                 };
 
                 let output = egui::ScrollArea::vertical()
                     .id_salt("editor_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        ui.set_min_height(ui.available_height());
                         ui.add(
                             egui::TextEdit::multiline(&mut self.text)
                                 .id(te_id)
                                 .font(egui::TextStyle::Monospace)
                                 .layouter(&mut layouter)
-                                .desired_width(size.x)
+                                .desired_width(f32::INFINITY)
                                 .frame(false),
                         )
                     })
@@ -1015,6 +1154,19 @@ impl eframe::App for EditorApp {
                 }
             }
         });
+
+        if self.pending_open {
+            self.pending_open = false;
+            self.open_file();
+        }
+        if self.pending_save {
+            self.pending_save = false;
+            self.save_file();
+        }
+        if self.pending_save_as {
+            self.pending_save_as = false;
+            self.save_as();
+        }
     }
 }
 
@@ -1022,7 +1174,12 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = env::args().collect();
     let path = args.get(1).map(PathBuf::from);
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([400.0, 300.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "Text Editor",
         options,
