@@ -317,6 +317,7 @@ struct EditorApp {
     pending_open: bool,
     pending_save: bool,
     pending_save_as: bool,
+    prev_mode: VimMode,
 }
 
 impl Default for EditorApp {
@@ -334,6 +335,7 @@ impl Default for EditorApp {
             pending_open: false,
             pending_save: false,
             pending_save_as: false,
+            prev_mode: VimMode::Normal,
         }
     }
 }
@@ -837,6 +839,10 @@ fn build_highlight_job(
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let entering_insert_now =
+            self.vim.mode == VimMode::Insert && self.prev_mode != VimMode::Insert;
+        self.prev_mode = self.vim.mode;
+
         ctx.input(|i| {
             let cmd_or_ctrl = i.modifiers.ctrl || i.modifiers.command;
             if cmd_or_ctrl && i.key_pressed(egui::Key::O) {
@@ -876,7 +882,9 @@ impl eframe::App for EditorApp {
 
                 if ui.checkbox(&mut self.vim_enabled, "Vim mode").changed() {
                     self.vim.mode = VimMode::Normal;
-                    if !self.vim_enabled {
+                    if self.vim_enabled {
+                        self.last_cursor = self.vim.cursor;
+                    } else {
                         let te_id = ui.make_persistent_id("main_text_edit");
                         let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
                             .chars()
@@ -936,7 +944,7 @@ impl eframe::App for EditorApp {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "move: (h/j/k/l) word: (w/b) insert: (i) append: (a) end-of-line (A) \
+                                "move: (j/k/l/h) word: (w/b) insert: (i) append: (a) end-of-line (A) \
                                  new-line: (o) del-char: (x) del-line: (dd) start/end: (0/$)\n\
                                  page-down: (Ctrl+F) page-up: (Ctrl+B) end-of-file: (G) top-of-file: (gg) \
                                  /search n/N save: (:w) save-quit: (:wq) quit: (:q)",
@@ -1098,7 +1106,9 @@ impl eframe::App for EditorApp {
             } else {
                 let te_id = ui.make_persistent_id("main_text_edit");
 
-                if self.vim_enabled && self.vim.mode == VimMode::Insert {
+                let just_entered_insert = entering_insert_now;
+
+                if just_entered_insert {
                     let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
                         .chars()
                         .count();
@@ -1118,34 +1128,42 @@ impl eframe::App for EditorApp {
                     ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap_w)))
                 };
 
-                let output = egui::ScrollArea::vertical()
+                let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("editor_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_height(ui.available_height());
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.text)
-                                .id(te_id)
-                                .font(egui::TextStyle::Monospace)
-                                .layouter(&mut layouter)
-                                .desired_width(f32::INFINITY)
-                                .frame(false),
-                        )
-                    })
-                    .inner;
+                    .auto_shrink([false, false]);
+                if just_entered_insert {
+                    scroll = scroll.vertical_scroll_offset(self.scroll_offset);
+                }
+                let scroll_out = scroll.show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.text)
+                            .id(te_id)
+                            .font(egui::TextStyle::Monospace)
+                            .layouter(&mut layouter)
+                            .desired_width(f32::INFINITY)
+                            .frame(false),
+                    )
+                });
+                let output = scroll_out.inner;
+                if !just_entered_insert {
+                    self.scroll_offset = scroll_out.state.offset.y;
+                }
 
                 if output.changed() {
                     self.dirty = true;
                 }
 
-                if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
-                    if let Some(range) = state.cursor.char_range() {
-                        self.vim.cursor = self
-                            .text
-                            .char_indices()
-                            .nth(range.primary.index)
-                            .map(|(i, _)| i)
-                            .unwrap_or(self.text.len());
+                if !just_entered_insert {
+                    if let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                        if let Some(range) = state.cursor.char_range() {
+                            self.vim.cursor = self
+                                .text
+                                .char_indices()
+                                .nth(range.primary.index)
+                                .map(|(i, _)| i)
+                                .unwrap_or(self.text.len());
+                        }
                     }
                 }
 
