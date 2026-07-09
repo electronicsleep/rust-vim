@@ -16,6 +16,7 @@ struct VimEngine {
     cursor: usize,
     pending_d: bool,
     pending_g: bool,
+    pending_r: bool,
     command_buf: String,
     status_msg: String,
     search_buf: String,
@@ -29,6 +30,7 @@ impl VimEngine {
             cursor: 0,
             pending_d: false,
             pending_g: false,
+            pending_r: false,
             command_buf: String::new(),
             status_msg: String::new(),
             search_buf: String::new(),
@@ -195,6 +197,9 @@ impl VimEngine {
         }
 
         match key {
+            egui::Key::R => {
+                self.pending_r = true;
+            }
             egui::Key::H => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -277,6 +282,23 @@ impl VimEngine {
     }
 
     fn handle_char_normal(&mut self, c: char, text: &mut String) {
+        if self.pending_r {
+            self.pending_r = false;
+            if !c.is_control() {
+                let pos = self.clamp(text);
+                if pos < text.len() {
+                    let cur_ch = text[pos..].chars().next();
+                    if let Some(old) = cur_ch {
+                        if old != '\n' {
+                            let end = pos + old.len_utf8();
+                            text.replace_range(pos..end, &c.to_string());
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         match c {
             '$' => {
                 self.cursor = self.line_end(text);
@@ -318,6 +340,9 @@ struct EditorApp {
     pending_save: bool,
     pending_save_as: bool,
     prev_mode: VimMode,
+    show_line_numbers: bool,
+    gutter_cache: Option<(usize, usize, egui::text::LayoutJob)>,
+    syntax_highlighting: bool,
 }
 
 impl Default for EditorApp {
@@ -326,7 +351,7 @@ impl Default for EditorApp {
             text: String::new(),
             file_path: None,
             dirty: false,
-            vim_enabled: false,
+            vim_enabled: true,
             vim: VimEngine::new(),
             show_help: false,
             last_cursor: usize::MAX,
@@ -336,6 +361,9 @@ impl Default for EditorApp {
             pending_save: false,
             pending_save_as: false,
             prev_mode: VimMode::Normal,
+            show_line_numbers: true,
+            gutter_cache: None,
+            syntax_highlighting: false,
         }
     }
 }
@@ -442,12 +470,47 @@ impl EditorApp {
             "help" | "h" => {
                 self.show_help = true;
             }
+            _ if !cmd.is_empty() && cmd.chars().all(|c| c.is_ascii_digit()) => {
+                let target: usize = cmd.parse().unwrap_or(1);
+                self.goto_line(target);
+            }
             _ => {
                 self.vim.status_msg = format!("Not a command: {}", cmd);
             }
         }
         self.vim.command_buf.clear();
         self.vim.mode = VimMode::Normal;
+    }
+
+    fn gutter_job(&mut self, total_lines: usize, current_line: usize) -> egui::text::LayoutJob {
+        if let Some((t, c, job)) = &self.gutter_cache {
+            if *t == total_lines && *c == current_line {
+                return job.clone();
+            }
+        }
+        let job = build_gutter_job(total_lines, current_line);
+        self.gutter_cache = Some((total_lines, current_line, job.clone()));
+        job
+    }
+
+    fn goto_line(&mut self, line_1based: usize) {
+        let total = self.text.chars().filter(|&ch| ch == '\n').count() + 1;
+        let target = line_1based.clamp(1, total);
+        let mut byte = 0usize;
+        let mut line = 1usize;
+        if target > 1 {
+            for (i, ch) in self.text.char_indices() {
+                if ch == '\n' {
+                    line += 1;
+                    if line == target {
+                        byte = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        self.vim.cursor = byte.min(self.text.len());
+        self.vim.status_msg = format!("line {}", target);
     }
 
     fn process_vim_command(&mut self, ctx: &egui::Context) {
@@ -583,6 +646,12 @@ impl EditorApp {
         });
 
         for (key, modifiers) in keys {
+            if self.vim.pending_r {
+                if key == egui::Key::Escape {
+                    self.vim.pending_r = false;
+                }
+                continue;
+            }
             match key {
                 egui::Key::Escape => {
                     self.vim.mode = VimMode::Normal;
@@ -653,6 +722,23 @@ fn tokenize(text: &str) -> Vec<Token<'_>> {
     let bytes = text.as_bytes();
 
     while i < text.len() {
+        if bytes[i] == b'/' && i + 1 < text.len() && bytes[i + 1] == b'*' {
+            let mut j = i + 2;
+            while j + 1 < text.len() {
+                if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    j += 2;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= text.len() {
+                j = text.len();
+            }
+            tokens.push(Token::Comment(&text[i..j]));
+            i = j;
+            continue;
+        }
+
         if bytes[i] == b'/' && i + 1 < text.len() && bytes[i + 1] == b'/' {
             let end = text[i..].find('\n').map(|n| i + n).unwrap_or(text.len());
             tokens.push(Token::Comment(&text[i..end]));
@@ -717,16 +803,43 @@ fn tokenize(text: &str) -> Vec<Token<'_>> {
     tokens
 }
 
+fn build_gutter_job(total_lines: usize, current_line: usize) -> egui::text::LayoutJob {
+    let mono = egui::FontId::monospace(14.0);
+    let dim = egui::Color32::from_rgb(110, 110, 120);
+    let bright = egui::Color32::from_rgb(200, 200, 120);
+
+    let width = total_lines.to_string().len().max(3);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+
+    for line in 0..total_lines {
+        let color = if line == current_line { bright } else { dim };
+        let text = format!("{:>width$}\n", line + 1, width = width);
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: mono.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
 fn build_highlight_job(
     text: &str,
     cursor_byte: Option<usize>,
     text_color: egui::Color32,
     wrap_width: f32,
+    highlight: bool,
 ) -> egui::text::LayoutJob {
     let mono = egui::FontId::monospace(14.0);
     let kw = egui::Color32::from_rgb(204, 120, 180);
     let ty = egui::Color32::from_rgb(86, 182, 194);
-    let comm = egui::Color32::from_rgb(128, 128, 128);
+    let comm = egui::Color32::from_rgb(106, 153, 85);
     let string = egui::Color32::from_rgb(152, 195, 121);
     let number = egui::Color32::from_rgb(209, 154, 84);
     let cursor_bg = egui::Color32::from_rgb(130, 200, 130);
@@ -740,21 +853,24 @@ fn build_highlight_job(
         ..Default::default()
     };
 
-    let tokens = tokenize(text);
-
     let mut spans: Vec<(usize, &str, egui::Color32)> = Vec::new();
-    let mut pos = 0usize;
-    for token in &tokens {
-        let (s, color) = match token {
-            Token::Keyword(s) => (*s, kw),
-            Token::Type_(s) => (*s, ty),
-            Token::Comment(s) => (*s, comm),
-            Token::StringLit(s) => (*s, string),
-            Token::Number(s) => (*s, number),
-            Token::Normal(s) => (*s, text_color),
-        };
-        spans.push((pos, s, color));
-        pos += s.len();
+    if highlight {
+        let tokens = tokenize(text);
+        let mut pos = 0usize;
+        for token in &tokens {
+            let (s, color) = match token {
+                Token::Keyword(s) => (*s, kw),
+                Token::Type_(s) => (*s, ty),
+                Token::Comment(s) => (*s, comm),
+                Token::StringLit(s) => (*s, string),
+                Token::Number(s) => (*s, number),
+                Token::Normal(s) => (*s, text_color),
+            };
+            spans.push((pos, s, color));
+            pos += s.len();
+        }
+    } else {
+        spans.push((0, text, text_color));
     }
 
     match cursor_byte {
@@ -900,6 +1016,9 @@ impl eframe::App for EditorApp {
                     }
                 }
 
+                ui.checkbox(&mut self.show_line_numbers, "Line numbers");
+                ui.checkbox(&mut self.syntax_highlighting, "Syntax");
+
                 if self.vim_enabled {
                     let label = match self.vim.mode {
                         VimMode::Normal => egui::RichText::new("NORMAL")
@@ -944,10 +1063,10 @@ impl eframe::App for EditorApp {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "move: (j/k/l/h) word: (w/b) insert: (i) append: (a) end-of-line (A) \
-                                 new-line: (o) del-char: (x) del-line: (dd) start/end: (0/$)\n\
-                                 page-down: (Ctrl+F) page-up: (Ctrl+B) end-of-file: (G) top-of-file: (gg) \
-                                 /search n/N save: (:w) save-quit: (:wq) quit: (:q)",
+                                "move: (j/k/l/h) word: (w/b) insert: (i) append: (a) end-line (A) \
+                                 new-line: (o) del-char: (x) replace: (r) del-line: (dd) start/end: (0/$)\n\
+                                 page-down: (Ctrl+F) page-up: (Ctrl+B) end-file: (G) top-file: (gg) \
+                                 /search n/N goto-line: (:n) save: (:w) save-quit: (:wq) quit: (:q)",
                             )
                             .size(18.0)
                             .weak(),
@@ -1018,6 +1137,7 @@ impl eframe::App for EditorApp {
 
                             section(ui, "Editing");
                             row(ui, "x", "Delete character under cursor");
+                            row(ui, "r<char>", "Replace character under cursor");
                             row(ui, "dd", "Delete current line");
 
                             section(ui, "Search  (Normal mode)");
@@ -1032,6 +1152,7 @@ impl eframe::App for EditorApp {
                             row(ui, ":q", "Quit");
                             row(ui, ":q!", "Quit without saving");
                             row(ui, ":help :h", "Show this help window");
+                            row(ui, ":<n>", "Jump to line number n");
 
                             section(ui, "Tips");
                             ui.label("Vim has two main modes: Normal and Insert.");
@@ -1069,7 +1190,18 @@ impl eframe::App for EditorApp {
 
                 let text_color = ui.visuals().text_color();
                 let wrap_width = ui.available_width();
-                let job = build_highlight_job(&self.text, Some(c), text_color, wrap_width);
+                let gutter_job = if self.show_line_numbers {
+                    Some(self.gutter_job(total_lines, cursor_line))
+                } else {
+                    None
+                };
+                let job = build_highlight_job(
+                    &self.text,
+                    Some(c),
+                    text_color,
+                    wrap_width,
+                    self.syntax_highlighting,
+                );
 
                 let cursor_moved = self.vim.cursor != self.last_cursor;
                 self.last_cursor = self.vim.cursor;
@@ -1095,8 +1227,14 @@ impl eframe::App for EditorApp {
                     .vertical_scroll_offset(self.scroll_offset)
                     .show(ui, |ui: &mut egui::Ui| {
                         ui.set_min_width(ui.available_width());
-                        let text_rect = ui.label(job).rect;
-                        self.text_h = text_rect.height();
+                        ui.horizontal_top(|ui| {
+                            if let Some(gutter) = gutter_job {
+                                ui.label(gutter);
+                                ui.separator();
+                            }
+                            let text_rect = ui.label(job).rect;
+                            self.text_h = text_rect.height();
+                        });
                         ui.add_space(line_height);
                     });
 
@@ -1124,8 +1262,18 @@ impl eframe::App for EditorApp {
                 let size = ui.available_size();
                 let text_color = ui.visuals().text_color();
                 let wrap_w = size.x;
+                let hl = self.syntax_highlighting;
                 let mut layouter = move |ui: &egui::Ui, s: &str, _wrap: f32| {
-                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap_w)))
+                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap_w, hl)))
+                };
+
+                let gutter_job = if self.show_line_numbers {
+                    let total_lines = self.text.chars().filter(|&ch| ch == '\n').count() + 1;
+                    let cur = self.vim.cursor.min(self.text.len());
+                    let current_line = self.text[..cur].chars().filter(|&ch| ch == '\n').count();
+                    Some(self.gutter_job(total_lines, current_line))
+                } else {
+                    None
                 };
 
                 let mut scroll = egui::ScrollArea::vertical()
@@ -1136,14 +1284,21 @@ impl eframe::App for EditorApp {
                 }
                 let scroll_out = scroll.show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.text)
-                            .id(te_id)
-                            .font(egui::TextStyle::Monospace)
-                            .layouter(&mut layouter)
-                            .desired_width(f32::INFINITY)
-                            .frame(false),
-                    )
+                    ui.horizontal_top(|ui| {
+                        if let Some(gutter) = gutter_job {
+                            ui.label(gutter);
+                            ui.separator();
+                        }
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.text)
+                                .id(te_id)
+                                .font(egui::TextStyle::Monospace)
+                                .layouter(&mut layouter)
+                                .desired_width(f32::INFINITY)
+                                .frame(false),
+                        )
+                    })
+                    .inner
                 });
                 let output = scroll_out.inner;
                 if !just_entered_insert {
