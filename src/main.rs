@@ -19,6 +19,7 @@ struct VimEngine {
     pending_r: bool,
     command_buf: String,
     status_msg: String,
+    status_time: Option<std::time::Instant>,
     search_buf: String,
     last_search: String,
 }
@@ -33,6 +34,7 @@ impl VimEngine {
             pending_r: false,
             command_buf: String::new(),
             status_msg: String::new(),
+            status_time: None,
             search_buf: String::new(),
             last_search: String::new(),
         }
@@ -40,6 +42,11 @@ impl VimEngine {
 
     fn clamp(&self, text: &str) -> usize {
         self.cursor.min(text.len())
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status_msg = msg;
+        self.status_time = Some(std::time::Instant::now());
     }
 
     fn line_start(&self, text: &str) -> usize {
@@ -152,12 +159,12 @@ impl VimEngine {
         let from = (start + 1).min(text.len());
         if let Some(pos) = text[from..].find(&self.last_search) {
             self.cursor = from + pos;
-            self.status_msg = format!("/{}", self.last_search);
+            self.set_status(format!("/{}", self.last_search));
         } else if let Some(pos) = text.find(&self.last_search) {
             self.cursor = pos;
-            self.status_msg = format!("/{} (wrapped)", self.last_search);
+            self.set_status(format!("/{} (wrapped)", self.last_search));
         } else {
-            self.status_msg = format!("Pattern not found: {}", self.last_search);
+            self.set_status(format!("Pattern not found: {}", self.last_search));
         }
     }
 
@@ -168,12 +175,12 @@ impl VimEngine {
         let start = self.clamp(text);
         if let Some(pos) = text[..start].rfind(&self.last_search) {
             self.cursor = pos;
-            self.status_msg = format!("?{}", self.last_search);
+            self.set_status(format!("?{}", self.last_search));
         } else if let Some(pos) = text.rfind(&self.last_search) {
             self.cursor = pos;
-            self.status_msg = format!("?{} (wrapped)", self.last_search);
+            self.set_status(format!("?{} (wrapped)", self.last_search));
         } else {
-            self.status_msg = format!("Pattern not found: {}", self.last_search);
+            self.set_status(format!("Pattern not found: {}", self.last_search));
         }
     }
 
@@ -343,6 +350,7 @@ struct EditorApp {
     show_line_numbers: bool,
     gutter_cache: Option<(usize, usize, egui::text::LayoutJob)>,
     syntax_highlighting: bool,
+    highlight_cache: Option<(u64, usize, u32, bool, egui::text::LayoutJob)>,
 }
 
 impl Default for EditorApp {
@@ -364,6 +372,7 @@ impl Default for EditorApp {
             show_line_numbers: true,
             gutter_cache: None,
             syntax_highlighting: false,
+            highlight_cache: None,
         }
     }
 }
@@ -431,7 +440,7 @@ impl EditorApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("file")
                         .to_string();
-                    self.vim.status_msg = format!("\"{}\" written", name);
+                    self.vim.set_status(format!("\"{}\" written", name));
                 } else {
                     self.pending_save_as = true;
                 }
@@ -439,7 +448,7 @@ impl EditorApp {
             "w!" => {
                 if self.file_path.is_some() {
                     self.save_file();
-                    self.vim.status_msg = "written (forced)".to_string();
+                    self.vim.set_status("written (forced)".to_string());
                 } else {
                     self.pending_save_as = true;
                 }
@@ -458,12 +467,13 @@ impl EditorApp {
                 let path = PathBuf::from(other[2..].trim());
                 match fs::write(&path, &self.text) {
                     Ok(_) => {
-                        self.vim.status_msg = format!("\"{}\" written", path.display());
+                        self.vim
+                            .set_status(format!("\"{}\" written", path.display()));
                         self.file_path = Some(path);
                         self.dirty = false;
                     }
                     Err(e) => {
-                        self.vim.status_msg = format!("Error: {}", e);
+                        self.vim.set_status(format!("Error: {}", e));
                     }
                 }
             }
@@ -475,7 +485,7 @@ impl EditorApp {
                 self.goto_line(target);
             }
             _ => {
-                self.vim.status_msg = format!("Not a command: {}", cmd);
+                self.vim.set_status(format!("Not a command: {}", cmd));
             }
         }
         self.vim.command_buf.clear();
@@ -490,6 +500,47 @@ impl EditorApp {
         }
         let job = build_gutter_job(total_lines, current_line);
         self.gutter_cache = Some((total_lines, current_line, job.clone()));
+        job
+    }
+
+    fn highlight_job(
+        &mut self,
+        cursor_byte: usize,
+        text_color: egui::Color32,
+        wrap_width: f32,
+    ) -> egui::text::LayoutJob {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.text.hash(&mut hasher);
+        let text_hash = hasher.finish();
+        let width_key = wrap_width as u32;
+
+        if let Some((h, cur, w, hl, job)) = &self.highlight_cache {
+            if *h == text_hash
+                && *cur == cursor_byte
+                && *w == width_key
+                && *hl == self.syntax_highlighting
+            {
+                return job.clone();
+            }
+        }
+
+        let job = build_highlight_job(
+            &self.text,
+            Some(cursor_byte),
+            text_color,
+            wrap_width,
+            self.syntax_highlighting,
+        );
+        self.highlight_cache = Some((
+            text_hash,
+            cursor_byte,
+            width_key,
+            self.syntax_highlighting,
+            job.clone(),
+        ));
         job
     }
 
@@ -510,7 +561,7 @@ impl EditorApp {
             }
         }
         self.vim.cursor = byte.min(self.text.len());
-        self.vim.status_msg = format!("line {}", target);
+        self.vim.set_status(format!("line {}", target));
     }
 
     fn process_vim_command(&mut self, ctx: &egui::Context) {
@@ -1058,8 +1109,17 @@ impl eframe::App for EditorApp {
                     ui.label(egui::RichText::new(format!("/{}", self.vim.search_buf)).monospace());
                 }
                 VimMode::Normal => {
-                    if !self.vim.status_msg.is_empty() {
+                    let show_status = !self.vim.status_msg.is_empty()
+                        && self
+                            .vim
+                            .status_time
+                            .map(|t| t.elapsed().as_millis() < 2000)
+                            .unwrap_or(false);
+
+                    if show_status {
                         ui.label(egui::RichText::new(&self.vim.status_msg).size(18.0));
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(250));
                     } else {
                         ui.label(
                             egui::RichText::new(
@@ -1195,13 +1255,7 @@ impl eframe::App for EditorApp {
                 } else {
                     None
                 };
-                let job = build_highlight_job(
-                    &self.text,
-                    Some(c),
-                    text_color,
-                    wrap_width,
-                    self.syntax_highlighting,
-                );
+                let job = self.highlight_job(c, text_color, wrap_width);
 
                 let cursor_moved = self.vim.cursor != self.last_cursor;
                 self.last_cursor = self.vim.cursor;

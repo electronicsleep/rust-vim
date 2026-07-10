@@ -2,13 +2,11 @@
 
 Simple Rust and Vim GUI Editor
 
-One day you will learn the power of Vim
-
 Hyper efficent with essential Vim support
 
-Verified working quicky on Raspberry Pi 400
+Verified working quicky on even Raspberry Pi 400
 
-Vim toggle and help for learning
+Vim toggle and on screen help for learning
 
 Minimal dependencies
 
@@ -20,3 +18,5 @@ cargo run -- README.md
 ```
 
 ![rust-vim screenshot](screenshot.jpg)
+
+https://www.egui.rs/
