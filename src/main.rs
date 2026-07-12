@@ -351,6 +351,7 @@ struct EditorApp {
     gutter_cache: Option<(usize, usize, egui::text::LayoutJob)>,
     syntax_highlighting: bool,
     highlight_cache: Option<(u64, usize, u32, bool, egui::text::LayoutJob)>,
+    undo_stack: Vec<(String, usize)>,
 }
 
 impl Default for EditorApp {
@@ -373,6 +374,7 @@ impl Default for EditorApp {
             gutter_cache: None,
             syntax_highlighting: false,
             highlight_cache: None,
+            undo_stack: Vec::new(),
         }
     }
 }
@@ -542,6 +544,23 @@ impl EditorApp {
             job.clone(),
         ));
         job
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push((self.text.clone(), self.vim.cursor));
+        if self.undo_stack.len() > 3 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some((text, cursor)) = self.undo_stack.pop() {
+            self.text = text;
+            self.vim.cursor = cursor.min(self.text.len());
+            self.vim.set_status("undo".to_string());
+        } else {
+            self.vim.set_status("Already at oldest change".to_string());
+        }
     }
 
     fn goto_line(&mut self, line_1based: usize) {
@@ -726,7 +745,18 @@ impl EditorApp {
                         self.vim.search_next(&text);
                     }
                 }
+                egui::Key::U => {
+                    self.undo();
+                }
                 other => {
+                    let edits = match other {
+                        egui::Key::X | egui::Key::O | egui::Key::I | egui::Key::A => true,
+                        egui::Key::D => self.vim.pending_d,
+                        _ => false,
+                    };
+                    if edits {
+                        self.push_undo();
+                    }
                     self.vim.handle_normal_key(other, &mut self.text);
                 }
             }
@@ -738,6 +768,9 @@ impl EditorApp {
                 self.vim.status_msg.clear();
                 self.vim.mode = VimMode::Command;
             } else {
+                if self.vim.pending_r {
+                    self.push_undo();
+                }
                 self.vim.handle_char_normal(c, &mut self.text);
             }
         }
@@ -1124,7 +1157,7 @@ impl eframe::App for EditorApp {
                         ui.label(
                             egui::RichText::new(
                                 "move: (j/k/l/h) word: (w/b) insert: (i) append: (a) end-line (A) \
-                                 new-line: (o) del-char: (x) replace: (r) del-line: (dd) start/end: (0/$)\n\
+                                 new-line: (o) del-char: (x) replace: (u) del-line: (dd) start/end: (0/$)\n\
                                  page-down: (Ctrl+F) page-up: (Ctrl+B) end-file: (G) top-file: (gg) \
                                  /search n/N goto-line: (:n) save: (:w) save-quit: (:wq) quit: (:q)",
                             )
@@ -1198,6 +1231,7 @@ impl eframe::App for EditorApp {
                             section(ui, "Editing");
                             row(ui, "x", "Delete character under cursor");
                             row(ui, "r<char>", "Replace character under cursor");
+                            row(ui, "u", "Undo");
                             row(ui, "dd", "Delete current line");
 
                             section(ui, "Search  (Normal mode)");
