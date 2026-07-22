@@ -1156,10 +1156,10 @@ impl eframe::App for EditorApp {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "move: (j/k/l/h) word: (w/b) insert: (i) append: (a) end-line (A) \
-                                 new-line: (o) del-char: (x) replace: (u) del-line: (dd) start/end: (0/$)\n\
-                                 page-down: (Ctrl+F) page-up: (Ctrl+B) end-file: (G) top-file: (gg) \
-                                 /search n/N goto-line: (:n) save: (:w) save-quit: (:wq) quit: (:q)",
+                                "move (j/k/l/h) word (w/b) insert (i) append (a) end-line (A) \
+                                 new-line (o) del-char (x) replace (u) del-line (dd) start/end (0/$)\n\
+                                 page-down (Ctrl+F) page-up (Ctrl+B) end-file (G) top-file (gg) \
+                                 /search (n/N) goto-line (:n) save (:w) save-quit (:wq) quit (:q)",
                             )
                             .size(18.0)
                             .weak(),
