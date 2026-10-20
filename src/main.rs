@@ -333,6 +333,93 @@ impl VimEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File tree (left sidebar)
+// ---------------------------------------------------------------------------
+
+struct FileNode {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    /// Loaded lazily the first time a directory is expanded.
+    children: Option<Vec<FileNode>>,
+}
+
+impl FileNode {
+    fn new(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let is_dir = path.is_dir();
+        Self {
+            path,
+            name,
+            is_dir,
+            children: None,
+        }
+    }
+
+    fn load_children(&mut self) {
+        let mut kids: Vec<FileNode> = fs::read_dir(&self.path)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    // Skip hidden entries like .git, .DS_Store
+                    .filter(|p| {
+                        !p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with('.'))
+                            .unwrap_or(false)
+                    })
+                    .map(FileNode::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Directories first, then files, both alphabetical (case-insensitive).
+        kids.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        self.children = Some(kids);
+    }
+}
+
+fn show_file_tree(
+    ui: &mut egui::Ui,
+    node: &mut FileNode,
+    current: Option<&PathBuf>,
+    clicked: &mut Option<PathBuf>,
+) {
+    if node.is_dir {
+        egui::CollapsingHeader::new(node.name.clone())
+            .id_salt(&node.path)
+            .show(ui, |ui| {
+                if node.children.is_none() {
+                    node.load_children();
+                }
+                if let Some(children) = node.children.as_mut() {
+                    if children.is_empty() {
+                        ui.weak("(empty)");
+                    }
+                    for child in children.iter_mut() {
+                        show_file_tree(ui, child, current, clicked);
+                    }
+                }
+            });
+    } else {
+        let selected = current == Some(&node.path);
+        if ui.selectable_label(selected, &node.name).clicked() {
+            *clicked = Some(node.path.clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 struct EditorApp {
     text: String,
     file_path: Option<PathBuf>,
@@ -344,6 +431,7 @@ struct EditorApp {
     scroll_offset: f32,
     text_h: f32,
     pending_open: bool,
+    pending_open_dir: bool,
     pending_save: bool,
     pending_save_as: bool,
     prev_mode: VimMode,
@@ -352,6 +440,10 @@ struct EditorApp {
     syntax_highlighting: bool,
     highlight_cache: Option<(u64, usize, u32, bool, egui::text::LayoutJob)>,
     undo_stack: Vec<(String, usize)>,
+    file_tree: Option<FileNode>,
+    show_file_panel: bool,
+    /// File the user asked to open while the current buffer had unsaved changes.
+    pending_switch: Option<PathBuf>,
 }
 
 impl Default for EditorApp {
@@ -367,6 +459,7 @@ impl Default for EditorApp {
             scroll_offset: 0.0,
             text_h: 0.0,
             pending_open: false,
+            pending_open_dir: false,
             pending_save: false,
             pending_save_as: false,
             prev_mode: VimMode::Normal,
@@ -375,38 +468,76 @@ impl Default for EditorApp {
             syntax_highlighting: false,
             highlight_cache: None,
             undo_stack: Vec::new(),
+            file_tree: None,
+            show_file_panel: false,
+            pending_switch: None,
         }
     }
 }
 
 impl EditorApp {
     fn from_path(path: Option<PathBuf>) -> Self {
-        match path {
-            Some(p) => match fs::read_to_string(&p) {
-                Ok(content) => Self {
-                    text: content,
-                    file_path: Some(p),
-                    show_help: false,
-                    ..Default::default()
-                },
-                Err(_) => Self {
-                    file_path: Some(p),
-                    show_help: false,
-                    ..Default::default()
-                },
-            },
-            None => Self::default(),
+        let mut app = Self::default();
+        if let Some(p) = path {
+            if p.is_dir() {
+                app.open_dir(p);
+            } else {
+                if let Ok(content) = fs::read_to_string(&p) {
+                    app.text = content;
+                }
+                app.file_path = Some(p);
+            }
+        }
+        app
+    }
+
+    /// Show `dir` in the left sidebar.
+    fn open_dir(&mut self, dir: PathBuf) {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let mut root = FileNode::new(dir);
+        root.load_children();
+        self.vim
+            .set_status(format!("opened folder {}", root.path.display()));
+        self.file_tree = Some(root);
+        self.show_file_panel = true;
+    }
+
+    /// Load a file into the editor, replacing the current buffer.
+    fn load_file(&mut self, path: PathBuf) {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                self.text = content;
+                self.file_path = Some(path);
+                self.dirty = false;
+                self.vim.cursor = 0;
+                self.vim.mode = VimMode::Normal;
+                self.undo_stack.clear();
+                self.scroll_offset = 0.0;
+                self.text_h = 0.0;
+                self.last_cursor = usize::MAX;
+            }
+            Err(e) => {
+                self.vim
+                    .set_status(format!("Can't open {}: {}", path.display(), e));
+            }
+        }
+    }
+
+    /// Open a file, asking first if the current buffer has unsaved changes.
+    fn request_open(&mut self, path: PathBuf) {
+        if self.file_path.as_ref() == Some(&path) {
+            return;
+        }
+        if self.dirty {
+            self.pending_switch = Some(path);
+        } else {
+            self.load_file(path);
         }
     }
 
     fn open_file(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                self.text = content;
-                self.file_path = Some(path);
-                self.dirty = false;
-                self.vim.cursor = 0;
-            }
+            self.request_open(path);
         }
     }
 
@@ -477,6 +608,33 @@ impl EditorApp {
                     Err(e) => {
                         self.vim.set_status(format!("Error: {}", e));
                     }
+                }
+            }
+            // :e <path>  — open a file, or a directory in the sidebar
+            other if other.starts_with("e ") || other.starts_with("edit ") => {
+                let arg = other.split_once(' ').map(|(_, a)| a.trim()).unwrap_or("");
+                let mut path = PathBuf::from(arg);
+                if path.is_relative() {
+                    if let Some(root) = &self.file_tree {
+                        path = root.path.join(path);
+                    }
+                }
+                if path.is_dir() {
+                    self.open_dir(path);
+                } else if path.is_file() {
+                    self.request_open(path);
+                } else {
+                    self.vim
+                        .set_status(format!("No such file or directory: {}", arg));
+                }
+            }
+            // :Ex — toggle the sidebar (opens the current directory if none yet)
+            "Ex" | "ex" | "explore" => {
+                if self.file_tree.is_some() {
+                    self.show_file_panel = !self.show_file_panel;
+                } else {
+                    let dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    self.open_dir(dir);
                 }
             }
             "help" | "h" => {
@@ -557,6 +715,7 @@ impl EditorApp {
         if let Some((text, cursor)) = self.undo_stack.pop() {
             self.text = text;
             self.vim.cursor = cursor.min(self.text.len());
+            self.dirty = true;
             self.vim.set_status("undo".to_string());
         } else {
             self.vim.set_status("Already at oldest change".to_string());
@@ -693,6 +852,7 @@ impl EditorApp {
     fn process_vim_normal(&mut self, ctx: &egui::Context) {
         let mut keys: Vec<(egui::Key, egui::Modifiers)> = vec![];
         let mut chars: Vec<char> = vec![];
+        let mut pushed_undo = false;
 
         ctx.input(|i| {
             for event in &i.events {
@@ -756,6 +916,7 @@ impl EditorApp {
                     };
                     if edits {
                         self.push_undo();
+                        pushed_undo = true;
                     }
                     self.vim.handle_normal_key(other, &mut self.text);
                 }
@@ -770,8 +931,19 @@ impl EditorApp {
             } else {
                 if self.vim.pending_r {
                     self.push_undo();
+                    pushed_undo = true;
                 }
                 self.vim.handle_char_normal(c, &mut self.text);
+            }
+        }
+
+        // Mark the buffer dirty if a normal-mode edit actually changed the text,
+        // so switching files from the sidebar can warn about unsaved changes.
+        if pushed_undo {
+            if let Some((before, _)) = self.undo_stack.last() {
+                if before != &self.text {
+                    self.dirty = true;
+                }
             }
         }
     }
@@ -1065,6 +1237,9 @@ impl eframe::App for EditorApp {
                 if ui.button("Open (Cmd/Ctrl+O)").clicked() {
                     self.pending_open = true;
                 }
+                if ui.button("Open Folder").clicked() {
+                    self.pending_open_dir = true;
+                }
                 if ui.button("Save (Cmd/Ctrl+S)").clicked() {
                     self.pending_save = true;
                 }
@@ -1102,6 +1277,9 @@ impl eframe::App for EditorApp {
 
                 ui.checkbox(&mut self.show_line_numbers, "Line numbers");
                 ui.checkbox(&mut self.syntax_highlighting, "Syntax");
+                if self.file_tree.is_some() {
+                    ui.checkbox(&mut self.show_file_panel, "Files");
+                }
 
                 if self.vim_enabled {
                     let label = match self.vim.mode {
@@ -1159,7 +1337,8 @@ impl eframe::App for EditorApp {
                                 "move (j/k/l/h) word (w/b) insert (i) append (a) end-line (A) \
                                  new-line (o) del-char (x) replace (u) del-line (dd) start/end (0/$)\n\
                                  page-down (Ctrl+F) page-up (Ctrl+B) end-file (G) top-file (gg) \
-                                 /search (n/N) goto-line (:n) save (:w) save-quit (:wq) quit (:q)",
+                                 /search (n/N) goto-line (:n) open (:e path) files (:Ex) \
+                                 save (:w) save-quit (:wq) quit (:q)",
                             )
                             .size(18.0)
                             .weak(),
@@ -1242,6 +1421,8 @@ impl eframe::App for EditorApp {
                             section(ui, "File Commands  (Normal mode, type : first)");
                             row(ui, ":w", "Save file");
                             row(ui, ":w file", "Save to a new filename");
+                            row(ui, ":e path", "Open a file, or a folder in the sidebar");
+                            row(ui, ":Ex", "Toggle the file sidebar");
                             row(ui, ":wq  :x", "Save and quit");
                             row(ui, ":q", "Quit");
                             row(ui, ":q!", "Quit without saving");
@@ -1254,6 +1435,7 @@ impl eframe::App for EditorApp {
                             ui.label("Press i to start typing, Esc to stop.");
                             ui.label("Use hjkl to move — arrow keys also work.");
                             ui.label("Type : to enter a command, Enter to run it.");
+                            ui.label("Launch with a folder (editor ./src) to browse it.");
                         });
 
                     ui.add_space(8.0);
@@ -1261,6 +1443,120 @@ impl eframe::App for EditorApp {
                         self.show_help = false;
                     }
                 });
+        }
+
+        // ---- Unsaved-changes prompt when switching files ----
+        if let Some(target) = self.pending_switch.clone() {
+            let cur_name = self
+                .file_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled")
+                .to_string();
+            let target_name = target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+
+            // 0 = save, 1 = discard, 2 = cancel
+            let mut choice: Option<u8> = None;
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Save changes to \"{}\" before opening \"{}\"?",
+                        cur_name, target_name
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            choice = Some(0);
+                        }
+                        if ui.button("Discard").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(2);
+                        }
+                    });
+                });
+
+            match choice {
+                Some(0) => {
+                    self.save_file();
+                    if !self.dirty {
+                        self.pending_switch = None;
+                        self.load_file(target);
+                    }
+                }
+                Some(1) => {
+                    self.pending_switch = None;
+                    self.load_file(target);
+                }
+                Some(2) => {
+                    self.pending_switch = None;
+                }
+                _ => {}
+            }
+        }
+
+        // ---- File sidebar (must be added before the CentralPanel) ----
+        let mut clicked: Option<PathBuf> = None;
+        if self.show_file_panel {
+            let current = self.file_path.clone();
+            if let Some(root) = self.file_tree.as_mut() {
+                let mut refresh = false;
+                let mut close = false;
+                egui::SidePanel::left("file_panel")
+                    .resizable(true)
+                    .default_width(220.0)
+                    .width_range(120.0..=500.0)
+                    .show(ctx, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.strong(&root.name)
+                                .on_hover_text(root.path.display().to_string());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("x").on_hover_text("Hide").clicked() {
+                                        close = true;
+                                    }
+                                    if ui.small_button("Refresh").clicked() {
+                                        refresh = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                        egui::ScrollArea::both()
+                            .id_salt("file_tree_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(children) = root.children.as_mut() {
+                                    if children.is_empty() {
+                                        ui.weak("(empty folder)");
+                                    }
+                                    for child in children.iter_mut() {
+                                        show_file_tree(ui, child, current.as_ref(), &mut clicked);
+                                    }
+                                }
+                            });
+                    });
+                if refresh {
+                    root.load_children();
+                }
+                if close {
+                    self.show_file_panel = false;
+                }
+            }
+        }
+        if let Some(path) = clicked {
+            self.request_open(path);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1419,6 +1715,12 @@ impl eframe::App for EditorApp {
         if self.pending_open {
             self.pending_open = false;
             self.open_file();
+        }
+        if self.pending_open_dir {
+            self.pending_open_dir = false;
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.open_dir(dir);
+            }
         }
         if self.pending_save {
             self.pending_save = false;
