@@ -17,6 +17,11 @@ struct VimEngine {
     pending_d: bool,
     pending_g: bool,
     pending_r: bool,
+    pending_y: bool,
+    /// Line-wise yank register (always ends with '\n').
+    register: Option<String>,
+    /// Set when the register changes, so the app can copy it to the system clipboard.
+    register_changed: bool,
     command_buf: String,
     status_msg: String,
     status_time: Option<std::time::Instant>,
@@ -32,6 +37,9 @@ impl VimEngine {
             pending_d: false,
             pending_g: false,
             pending_r: false,
+            pending_y: false,
+            register: None,
+            register_changed: false,
             command_buf: String::new(),
             status_msg: String::new(),
             status_time: None,
@@ -184,6 +192,44 @@ impl VimEngine {
         }
     }
 
+    /// Copy the current line (with trailing newline) into the register.
+    fn yank_line(&mut self, text: &str) {
+        let start = self.line_start(text);
+        let end = self.line_end(text);
+        let mut line = text[start..end].to_string();
+        line.push('\n');
+        self.register = Some(line);
+        self.register_changed = true;
+    }
+
+    /// Paste the register below (p) or above (P) the current line.
+    /// Returns true if anything was pasted.
+    fn paste(&mut self, text: &mut String, above: bool) -> bool {
+        self.pending_d = false;
+        self.pending_g = false;
+        self.pending_y = false;
+        let Some(reg) = self.register.clone() else {
+            self.set_status("Nothing to paste (yank with yy)".to_string());
+            return false;
+        };
+        if above {
+            let start = self.line_start(text);
+            text.insert_str(start, &reg);
+            self.cursor = start;
+        } else {
+            let end = self.line_end(text);
+            if end == text.len() {
+                // Last line has no trailing newline: add one before the pasted line.
+                let body = &reg[..reg.len() - 1];
+                text.insert_str(end, &format!("\n{}", body));
+            } else {
+                text.insert_str(end + 1, &reg);
+            }
+            self.cursor = end + 1;
+        }
+        true
+    }
+
     fn page_down(&mut self, text: &str, lines: usize) {
         for _ in 0..lines {
             self.move_down(text);
@@ -199,6 +245,8 @@ impl VimEngine {
     fn handle_normal_key(&mut self, key: egui::Key, text: &mut String) -> bool {
         let was_pending_d = self.pending_d;
         self.pending_d = false;
+        let was_pending_y = self.pending_y;
+        self.pending_y = false;
         if key != egui::Key::G {
             self.pending_g = false;
         }
@@ -241,6 +289,8 @@ impl VimEngine {
 
             egui::Key::D => {
                 if was_pending_d {
+                    // dd also cuts the line into the register, so dd + p moves a line.
+                    self.yank_line(text);
                     let start = self.line_start(text);
                     let end = self.line_end(text);
                     if end < text.len() {
@@ -253,6 +303,15 @@ impl VimEngine {
                     self.cursor = start.min(text.len());
                 } else {
                     self.pending_d = true;
+                }
+            }
+
+            egui::Key::Y => {
+                if was_pending_y {
+                    self.yank_line(text);
+                    self.set_status("1 line yanked (copied to clipboard)".to_string());
+                } else {
+                    self.pending_y = true;
                 }
             }
 
@@ -908,6 +967,13 @@ impl EditorApp {
                 egui::Key::U => {
                     self.undo();
                 }
+                egui::Key::P => {
+                    self.push_undo();
+                    pushed_undo = true;
+                    let mut text = std::mem::take(&mut self.text);
+                    self.vim.paste(&mut text, modifiers.shift);
+                    self.text = text;
+                }
                 other => {
                     let edits = match other {
                         egui::Key::X | egui::Key::O | egui::Key::I | egui::Key::A => true,
@@ -934,6 +1000,14 @@ impl EditorApp {
                     pushed_undo = true;
                 }
                 self.vim.handle_char_normal(c, &mut self.text);
+            }
+        }
+
+        // Mirror yanked/cut lines to the system clipboard.
+        if self.vim.register_changed {
+            self.vim.register_changed = false;
+            if let Some(reg) = &self.vim.register {
+                ctx.copy_text(reg.clone());
             }
         }
 
@@ -1335,7 +1409,7 @@ impl eframe::App for EditorApp {
                         ui.label(
                             egui::RichText::new(
                                 "move (j/k/l/h) word (w/b) insert (i) append (a) end-line (A) \
-                                 new-line (o) del-char (x) replace (u) del-line (dd) start/end (0/$)\n\
+                                 new-line (o) del-char (x) replace (u) del-line (dd) yank-line (yy) paste (p/P) start/end (0/$)\n\
                                  page-down (Ctrl+F) page-up (Ctrl+B) end-file (G) top-file (gg) \
                                  /search (n/N) goto-line (:n) open (:e path) files (:Ex) \
                                  save (:w) save-quit (:wq) quit (:q)",
@@ -1411,7 +1485,10 @@ impl eframe::App for EditorApp {
                             row(ui, "x", "Delete character under cursor");
                             row(ui, "r<char>", "Replace character under cursor");
                             row(ui, "u", "Undo");
-                            row(ui, "dd", "Delete current line");
+                            row(ui, "dd", "Delete (cut) current line");
+                            row(ui, "yy", "Yank (copy) current line");
+                            row(ui, "p", "Paste below current line");
+                            row(ui, "P", "Paste above current line");
 
                             section(ui, "Search  (Normal mode)");
                             row(ui, "/text", "Search forward for text, Enter to jump");
