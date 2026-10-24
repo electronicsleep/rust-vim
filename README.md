@@ -1,6 +1,6 @@
 # rust-vim
 
-Simple Rust and Vim GUI Editor
+Simple Rust and Vim GUI editor for learning
 
 Hyper efficient with essential Vim support
 
