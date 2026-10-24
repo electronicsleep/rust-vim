@@ -9,6 +9,10 @@ enum VimMode {
     Insert,
     Command,
     Search,
+    /// `v`: character-wise selection
+    Visual,
+    /// `V`: line-wise selection
+    VisualLine,
 }
 
 struct VimEngine {
@@ -22,6 +26,12 @@ struct VimEngine {
     register: Option<String>,
     /// Set when the register changes, so the app can copy it to the system clipboard.
     register_changed: bool,
+    /// true if the register holds whole lines (yy, dd, V), false for a
+    /// character-wise selection (v). Decides how p/P paste it.
+    register_linewise: bool,
+    /// Where the selection started when v/V was pressed. The selection runs
+    /// from here to the cursor.
+    visual_anchor: usize,
     command_buf: String,
     status_msg: String,
     status_time: Option<std::time::Instant>,
@@ -40,6 +50,8 @@ impl VimEngine {
             pending_y: false,
             register: None,
             register_changed: false,
+            register_linewise: true,
+            visual_anchor: 0,
             command_buf: String::new(),
             status_msg: String::new(),
             status_time: None,
@@ -199,7 +211,82 @@ impl VimEngine {
         let mut line = text[start..end].to_string();
         line.push('\n');
         self.register = Some(line);
+        self.register_linewise = true;
         self.register_changed = true;
+    }
+
+    fn is_visual(&self) -> bool {
+        matches!(self.mode, VimMode::Visual | VimMode::VisualLine)
+    }
+
+    /// Byte range [start, end) covered by the current selection.
+    /// For V (line-wise) it spans whole lines, not including the final '\n'.
+    fn selection_range(&self, text: &str) -> (usize, usize) {
+        let a = self.visual_anchor.min(text.len());
+        let c = self.clamp(text);
+        let (lo, hi) = if a <= c { (a, c) } else { (c, a) };
+        if self.mode == VimMode::VisualLine {
+            let start = text[..lo].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let end = text[hi..].find('\n').map(|i| hi + i).unwrap_or(text.len());
+            (start, end)
+        } else {
+            // Inclusive of the character under the cursor, like Vim.
+            let end = text[hi..]
+                .chars()
+                .next()
+                .map(|ch| hi + ch.len_utf8())
+                .unwrap_or(text.len());
+            (lo, end)
+        }
+    }
+
+    /// Copy the selection into the register and move the cursor to its start.
+    fn yank_selection(&mut self, text: &str) {
+        let (start, end) = self.selection_range(text);
+        if self.mode == VimMode::VisualLine {
+            let mut t = text[start..end].to_string();
+            t.push('\n');
+            let n = t.matches('\n').count();
+            self.register = Some(t);
+            self.register_linewise = true;
+            self.set_status(format!("{} line{} yanked", n, if n == 1 { "" } else { "s" }));
+        } else {
+            let t = text[start..end].to_string();
+            let n = t.chars().count();
+            self.register = Some(t);
+            self.register_linewise = false;
+            self.set_status(format!(
+                "{} character{} yanked",
+                n,
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+        self.register_changed = true;
+        self.cursor = start;
+    }
+
+    /// Cut the selection: copy it into the register, then remove it.
+    fn delete_selection(&mut self, text: &mut String) {
+        let (start, end) = self.selection_range(text);
+        let linewise = self.mode == VimMode::VisualLine;
+        self.yank_selection(text);
+        if linewise {
+            // Same newline handling as dd.
+            if end < text.len() {
+                text.drain(start..=end);
+                self.cursor = start;
+            } else if start > 0 {
+                text.drain(start - 1..end);
+                self.cursor = text[..start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            } else {
+                text.drain(start..end);
+                self.cursor = 0;
+            }
+        } else {
+            text.drain(start..end);
+            self.cursor = start.min(text.len());
+        }
+        self.status_msg = self.status_msg.replace("yanked", "deleted");
     }
 
     /// Paste the register below (p) or above (P) the current line.
@@ -212,6 +299,22 @@ impl VimEngine {
             self.set_status("Nothing to paste (yank with yy)".to_string());
             return false;
         };
+        if !self.register_linewise {
+            // Character-wise: P inserts at the cursor, p just after it.
+            let c = self.clamp(text);
+            let pos = if above {
+                c
+            } else {
+                match text[c..].chars().next() {
+                    Some(ch) if ch != '\n' => c + ch.len_utf8(),
+                    _ => c,
+                }
+            };
+            text.insert_str(pos, &reg);
+            let last = reg.chars().last().map(|ch| ch.len_utf8()).unwrap_or(0);
+            self.cursor = pos + reg.len() - last;
+            return true;
+        }
         if above {
             let start = self.line_start(text);
             text.insert_str(start, &reg);
@@ -220,7 +323,7 @@ impl VimEngine {
             let end = self.line_end(text);
             if end == text.len() {
                 // Last line has no trailing newline: add one before the pasted line.
-                let body = &reg[..reg.len() - 1];
+                let body = reg.strip_suffix('\n').unwrap_or(&reg);
                 text.insert_str(end, &format!("\n{}", body));
             } else {
                 text.insert_str(end + 1, &reg);
@@ -497,7 +600,7 @@ struct EditorApp {
     show_line_numbers: bool,
     gutter_cache: Option<(usize, usize, egui::text::LayoutJob)>,
     syntax_highlighting: bool,
-    highlight_cache: Option<(u64, usize, u32, bool, egui::text::LayoutJob)>,
+    highlight_cache: Option<(u64, usize, Option<(usize, usize)>, u32, bool, egui::text::LayoutJob)>,
     undo_stack: Vec<(String, usize)>,
     file_tree: Option<FileNode>,
     show_file_panel: bool,
@@ -725,6 +828,7 @@ impl EditorApp {
     fn highlight_job(
         &mut self,
         cursor_byte: usize,
+        selection: Option<(usize, usize)>,
         text_color: egui::Color32,
         wrap_width: f32,
     ) -> egui::text::LayoutJob {
@@ -736,9 +840,10 @@ impl EditorApp {
         let text_hash = hasher.finish();
         let width_key = wrap_width as u32;
 
-        if let Some((h, cur, w, hl, job)) = &self.highlight_cache {
+        if let Some((h, cur, sel, w, hl, job)) = &self.highlight_cache {
             if *h == text_hash
                 && *cur == cursor_byte
+                && *sel == selection
                 && *w == width_key
                 && *hl == self.syntax_highlighting
             {
@@ -749,6 +854,7 @@ impl EditorApp {
         let job = build_highlight_job(
             &self.text,
             Some(cursor_byte),
+            selection,
             text_color,
             wrap_width,
             self.syntax_highlighting,
@@ -756,6 +862,7 @@ impl EditorApp {
         self.highlight_cache = Some((
             text_hash,
             cursor_byte,
+            selection,
             width_key,
             self.syntax_highlighting,
             job.clone(),
@@ -934,6 +1041,12 @@ impl EditorApp {
             }
         });
 
+        if self.vim.is_visual() {
+            let changed = self.process_visual(&keys, &chars);
+            self.finish_vim_frame(ctx, changed);
+            return;
+        }
+
         for (key, modifiers) in keys {
             if self.vim.pending_r {
                 if key == egui::Key::Escape {
@@ -966,6 +1079,18 @@ impl EditorApp {
                 }
                 egui::Key::U => {
                     self.undo();
+                }
+                egui::Key::V => {
+                    // Start a selection at the cursor.
+                    self.vim.visual_anchor = self.vim.cursor.min(self.text.len());
+                    self.vim.pending_d = false;
+                    self.vim.pending_y = false;
+                    self.vim.pending_g = false;
+                    self.vim.mode = if modifiers.shift {
+                        VimMode::VisualLine
+                    } else {
+                        VimMode::Visual
+                    };
                 }
                 egui::Key::P => {
                     self.push_undo();
@@ -1003,7 +1128,83 @@ impl EditorApp {
             }
         }
 
-        // Mirror yanked/cut lines to the system clipboard.
+        self.finish_vim_frame(ctx, pushed_undo);
+    }
+
+    /// Keys while in Visual / Visual Line mode. Returns true if text may have changed.
+    fn process_visual(&mut self, keys: &[(egui::Key, egui::Modifiers)], chars: &[char]) -> bool {
+        let mut changed = false;
+        for &(key, modifiers) in keys {
+            if !self.vim.is_visual() {
+                break;
+            }
+            match key {
+                egui::Key::Escape => self.vim.mode = VimMode::Normal,
+                egui::Key::V => {
+                    // v in v-mode (or V in V-mode) exits; the other one switches kind.
+                    let target = if modifiers.shift {
+                        VimMode::VisualLine
+                    } else {
+                        VimMode::Visual
+                    };
+                    self.vim.mode = if self.vim.mode == target {
+                        VimMode::Normal
+                    } else {
+                        target
+                    };
+                }
+                egui::Key::Y => {
+                    self.vim.yank_selection(&self.text);
+                    self.vim.mode = VimMode::Normal;
+                }
+                egui::Key::D | egui::Key::X => {
+                    self.push_undo();
+                    changed = true;
+                    self.vim.delete_selection(&mut self.text);
+                    self.vim.mode = VimMode::Normal;
+                }
+                egui::Key::O => {
+                    // Jump to the other end of the selection.
+                    let c = self.vim.cursor;
+                    self.vim.cursor = self.vim.visual_anchor;
+                    self.vim.visual_anchor = c;
+                }
+                egui::Key::F if modifiers.ctrl => self.vim.page_down(&self.text.clone(), 20),
+                egui::Key::B if modifiers.ctrl => self.vim.page_up(&self.text.clone(), 20),
+                egui::Key::N => {
+                    let text = self.text.clone();
+                    if modifiers.shift {
+                        self.vim.search_prev(&text);
+                    } else {
+                        self.vim.search_next(&text);
+                    }
+                }
+                // Movement keys extend the selection.
+                egui::Key::H
+                | egui::Key::J
+                | egui::Key::K
+                | egui::Key::L
+                | egui::Key::W
+                | egui::Key::B
+                | egui::Key::Num0
+                | egui::Key::Num4
+                | egui::Key::G => {
+                    self.vim.handle_normal_key(key, &mut self.text);
+                }
+                _ => {}
+            }
+        }
+        for &c in chars {
+            if self.vim.is_visual() && (c == '$' || c == 'G') {
+                self.vim.handle_char_normal(c, &mut self.text);
+            }
+        }
+        changed
+    }
+
+    /// End-of-frame bookkeeping shared by Normal and Visual mode.
+    fn finish_vim_frame(&mut self, ctx: &egui::Context, pushed_undo: bool) {
+        // Mirror yanked/cut text to the system clipboard.
         if self.vim.register_changed {
             self.vim.register_changed = false;
             if let Some(reg) = &self.vim.register {
@@ -1162,6 +1363,7 @@ fn build_gutter_job(total_lines: usize, current_line: usize) -> egui::text::Layo
 fn build_highlight_job(
     text: &str,
     cursor_byte: Option<usize>,
+    selection: Option<(usize, usize)>,
     text_color: egui::Color32,
     wrap_width: f32,
     highlight: bool,
@@ -1173,21 +1375,33 @@ fn build_highlight_job(
     let string = egui::Color32::from_rgb(152, 195, 121);
     let number = egui::Color32::from_rgb(209, 154, 84);
     let cursor_bg = egui::Color32::from_rgb(130, 200, 130);
+    let sel_bg = egui::Color32::from_rgba_unmultiplied(80, 130, 220, 110);
 
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
-    let fmt = |color: egui::Color32| egui::TextFormat {
+    let fmt = |color: egui::Color32, selected: bool| egui::TextFormat {
         font_id: mono.clone(),
         color,
+        background: if selected {
+            sel_bg
+        } else {
+            egui::Color32::TRANSPARENT
+        },
+        ..Default::default()
+    };
+    let cursor_fmt = egui::TextFormat {
+        font_id: mono.clone(),
+        color: egui::Color32::BLACK,
+        background: cursor_bg,
         ..Default::default()
     };
 
+    // 1. Split the text into colored spans (one big span if highlighting is off).
     let mut spans: Vec<(usize, &str, egui::Color32)> = Vec::new();
     if highlight {
-        let tokens = tokenize(text);
         let mut pos = 0usize;
-        for token in &tokens {
+        for token in &tokenize(text) {
             let (s, color) = match token {
                 Token::Keyword(s) => (*s, kw),
                 Token::Type_(s) => (*s, ty),
@@ -1203,81 +1417,63 @@ fn build_highlight_job(
         spans.push((0, text, text_color));
     }
 
-    match cursor_byte {
-        None => {
-            for (_, s, color) in spans {
-                job.append(s, 0.0, fmt(color));
-            }
+    // 2. Byte positions where the look changes: selection edges and the
+    //    cursor character. Spans get cut at these points.
+    let mut cuts: Vec<usize> = Vec::new();
+    if let Some((s, e)) = selection {
+        cuts.push(s);
+        cuts.push(e);
+        // Isolate each selected '\n' so it can be drawn as a visible block.
+        for (i, _) in text[s..e].match_indices('\n') {
+            cuts.push(s + i);
+            cuts.push(s + i + 1);
         }
-        Some(cursor) => {
-            let mut cursor_drawn = false;
-            for (span_start, s, color) in spans {
-                let span_end = span_start + s.len();
+    }
+    if let Some(c) = cursor_byte {
+        if let Some(ch) = text.get(c..).and_then(|t| t.chars().next()) {
+            cuts.push(c);
+            cuts.push(c + ch.len_utf8());
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
 
-                if cursor >= span_end || cursor < span_start {
-                    job.append(s, 0.0, fmt(color));
+    // 3. Emit each piece with the right background.
+    for (span_start, s, color) in spans {
+        let span_end = span_start + s.len();
+        let mut points = vec![span_start];
+        points.extend(cuts.iter().copied().filter(|&p| p > span_start && p < span_end));
+        points.push(span_end);
+
+        for w in points.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a == b {
+                continue;
+            }
+            let piece = &s[a - span_start..b - span_start];
+            let selected = selection.map(|(ss, se)| a >= ss && a < se).unwrap_or(false);
+
+            if cursor_byte == Some(a) {
+                if piece == "\n" {
+                    // Cursor at end of line: draw a block, then the newline.
+                    job.append(" ", 0.0, cursor_fmt.clone());
+                    job.append(piece, 0.0, fmt(color, selected));
                 } else {
-                    cursor_drawn = true;
-                    let rel = cursor - span_start;
-                    let before = &s[..rel];
-                    let raw_ch = s[rel..].chars().next();
-
-                    if !before.is_empty() {
-                        job.append(before, 0.0, fmt(color));
-                    }
-
-                    match raw_ch {
-                        None | Some('\n') => {
-                            job.append(
-                                " ",
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: mono.clone(),
-                                    color: egui::Color32::BLACK,
-                                    background: cursor_bg,
-                                    ..Default::default()
-                                },
-                            );
-                            let after_start = rel + raw_ch.map(|c| c.len_utf8()).unwrap_or(0);
-                            if after_start < s.len() {
-                                job.append(&s[rel..], 0.0, fmt(color));
-                            } else if raw_ch == Some('\n') {
-                                job.append("\n", 0.0, fmt(color));
-                            }
-                        }
-                        Some(ch) => {
-                            let ch_end = rel + ch.len_utf8();
-                            job.append(
-                                &s[rel..ch_end],
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: mono.clone(),
-                                    color: egui::Color32::BLACK,
-                                    background: cursor_bg,
-                                    ..Default::default()
-                                },
-                            );
-                            if ch_end < s.len() {
-                                job.append(&s[ch_end..], 0.0, fmt(color));
-                            }
-                        }
-                    }
+                    job.append(piece, 0.0, cursor_fmt.clone());
                 }
-            }
-
-            if !cursor_drawn {
-                job.append(
-                    " ",
-                    0.0,
-                    egui::TextFormat {
-                        font_id: mono.clone(),
-                        color: egui::Color32::BLACK,
-                        background: cursor_bg,
-                        ..Default::default()
-                    },
-                );
+            } else if selected && piece == "\n" {
+                // Show a selected line break (so empty selected lines are visible).
+                job.append(" ", 0.0, fmt(color, true));
+                job.append(piece, 0.0, fmt(color, false));
+            } else {
+                job.append(piece, 0.0, fmt(color, selected));
             }
         }
+    }
+
+    // Cursor past the last character.
+    if cursor_byte.map(|c| c >= text.len()).unwrap_or(false) {
+        job.append(" ", 0.0, cursor_fmt);
     }
 
     job
@@ -1369,6 +1565,12 @@ impl eframe::App for EditorApp {
                         VimMode::Search => egui::RichText::new("SEARCH")
                             .color(egui::Color32::from_rgb(200, 140, 220))
                             .strong(),
+                        VimMode::Visual => egui::RichText::new("VISUAL")
+                            .color(egui::Color32::from_rgb(240, 140, 90))
+                            .strong(),
+                        VimMode::VisualLine => egui::RichText::new("V-LINE")
+                            .color(egui::Color32::from_rgb(240, 140, 90))
+                            .strong(),
                     };
                     ui.label(label);
                 }
@@ -1409,7 +1611,7 @@ impl eframe::App for EditorApp {
                         ui.label(
                             egui::RichText::new(
                                 "move (j/k/l/h) word (w/b) insert (i) append (a) end-line (A) \
-                                 new-line (o) del-char (x) replace (u) del-line (dd) yank-line (yy) paste (p/P) start/end (0/$)\n\
+                                 new-line (o) del-char (x) replace (u) del-line (dd) yank-line (yy) paste (p/P) visual (v/V) start/end (0/$)\n\
                                  page-down (Ctrl+F) page-up (Ctrl+B) end-file (G) top-file (gg) \
                                  /search (n/N) goto-line (:n) open (:e path) files (:Ex) \
                                  save (:w) save-quit (:wq) quit (:q)",
@@ -1418,6 +1620,25 @@ impl eframe::App for EditorApp {
                             .weak(),
                         );
                     }
+                }
+                VimMode::Visual | VimMode::VisualLine => {
+                    let (s, e) = self.vim.selection_range(&self.text);
+                    let info = if self.vim.mode == VimMode::VisualLine {
+                        let n = self.text[s..e].matches('\n').count() + 1;
+                        format!("{} line{}", n, if n == 1 { "" } else { "s" })
+                    } else {
+                        let n = self.text[s..e].chars().count();
+                        format!("{} char{}", n, if n == 1 { "" } else { "s" })
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} selected   move to extend   y yank   d delete   \
+                             o other end   Esc cancel",
+                            info
+                        ))
+                        .size(18.0)
+                        .weak(),
+                    );
                 }
                 VimMode::Insert => {
                     ui.label(
@@ -1489,6 +1710,16 @@ impl eframe::App for EditorApp {
                             row(ui, "yy", "Yank (copy) current line");
                             row(ui, "p", "Paste below current line");
                             row(ui, "P", "Paste above current line");
+
+                            section(ui, "Visual Mode  (select text)");
+                            row(ui, "v", "Start selecting characters");
+                            row(ui, "V", "Start selecting whole lines");
+                            row(ui, "move", "h j k l w b 0 $ gg G extend the selection");
+                            row(ui, "y", "Yank (copy) the selection");
+                            row(ui, "d  x", "Delete (cut) the selection");
+                            row(ui, "o", "Jump to the other end of the selection");
+                            row(ui, "Esc  v", "Cancel the selection");
+                            row(ui, "p  P", "After v-yank: paste after / at the cursor");
 
                             section(ui, "Search  (Normal mode)");
                             row(ui, "/text", "Search forward for text, Enter to jump");
@@ -1639,10 +1870,11 @@ impl eframe::App for EditorApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.vim_enabled
                 && (self.vim.mode == VimMode::Normal
+                    || self.vim.is_visual()
                     || self.vim.mode == VimMode::Command
                     || self.vim.mode == VimMode::Search)
             {
-                if self.vim.mode == VimMode::Normal {
+                if self.vim.mode == VimMode::Normal || self.vim.is_visual() {
                     self.process_vim_normal(ctx);
                 } else if self.vim.mode == VimMode::Command {
                     self.process_vim_command(ctx);
@@ -1662,7 +1894,12 @@ impl eframe::App for EditorApp {
                 } else {
                     None
                 };
-                let job = self.highlight_job(c, text_color, wrap_width);
+                let selection = if self.vim.is_visual() {
+                    Some(self.vim.selection_range(&self.text))
+                } else {
+                    None
+                };
+                let job = self.highlight_job(c, selection, text_color, wrap_width);
 
                 let cursor_moved = self.vim.cursor != self.last_cursor;
                 self.last_cursor = self.vim.cursor;
@@ -1725,7 +1962,7 @@ impl eframe::App for EditorApp {
                 let wrap_w = size.x;
                 let hl = self.syntax_highlighting;
                 let mut layouter = move |ui: &egui::Ui, s: &str, _wrap: f32| {
-                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, text_color, wrap_w, hl)))
+                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, None, text_color, wrap_w, hl)))
                 };
 
                 let gutter_job = if self.show_line_numbers {
