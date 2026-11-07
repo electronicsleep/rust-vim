@@ -249,7 +249,11 @@ impl VimEngine {
             let n = t.matches('\n').count();
             self.register = Some(t);
             self.register_linewise = true;
-            self.set_status(format!("{} line{} yanked", n, if n == 1 { "" } else { "s" }));
+            self.set_status(format!(
+                "{} line{} yanked",
+                n,
+                if n == 1 { "" } else { "s" }
+            ));
         } else {
             let t = text[start..end].to_string();
             let n = t.chars().count();
@@ -600,7 +604,14 @@ struct EditorApp {
     show_line_numbers: bool,
     gutter_cache: Option<(usize, usize, egui::text::LayoutJob)>,
     syntax_highlighting: bool,
-    highlight_cache: Option<(u64, usize, Option<(usize, usize)>, u32, bool, egui::text::LayoutJob)>,
+    highlight_cache: Option<(
+        u64,
+        usize,
+        Option<(usize, usize)>,
+        u32,
+        bool,
+        egui::text::LayoutJob,
+    )>,
     undo_stack: Vec<(String, usize)>,
     file_tree: Option<FileNode>,
     show_file_panel: bool,
@@ -1442,7 +1453,11 @@ fn build_highlight_job(
     for (span_start, s, color) in spans {
         let span_end = span_start + s.len();
         let mut points = vec![span_start];
-        points.extend(cuts.iter().copied().filter(|&p| p > span_start && p < span_end));
+        points.extend(
+            cuts.iter()
+                .copied()
+                .filter(|&p| p > span_start && p < span_end),
+        );
         points.push(span_end);
 
         for w in points.windows(2) {
@@ -1962,7 +1977,9 @@ impl eframe::App for EditorApp {
                 let wrap_w = size.x;
                 let hl = self.syntax_highlighting;
                 let mut layouter = move |ui: &egui::Ui, s: &str, _wrap: f32| {
-                    ui.fonts(|f| f.layout_job(build_highlight_job(s, None, None, text_color, wrap_w, hl)))
+                    ui.fonts(|f| {
+                        f.layout_job(build_highlight_job(s, None, None, text_color, wrap_w, hl))
+                    })
                 };
 
                 let gutter_job = if self.show_line_numbers {
@@ -2053,8 +2070,9 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_inner_size([1600.0, 1000.0])
+            .with_min_inner_size([1000.0, 600.0])
+            .with_maximized(true),
         ..Default::default()
     };
     eframe::run_native(
