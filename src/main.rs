@@ -3,6 +3,18 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+/// Word class used by w / b / e: 0 = whitespace, 1 = word chars, 2 = punctuation.
+fn char_class(b: u8) -> u8 {
+    let ch = b as char;
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
+    }
+}
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum VimMode {
     Normal,
@@ -115,16 +127,7 @@ impl VimEngine {
             return;
         }
 
-        let class = |b: u8| -> u8 {
-            let ch = b as char;
-            if ch.is_whitespace() {
-                0
-            } else if ch.is_alphanumeric() || ch == '_' {
-                1
-            } else {
-                2
-            }
-        };
+        let class = char_class;
 
         let start_class = class(bytes[i]);
         if start_class != 0 {
@@ -146,16 +149,7 @@ impl VimEngine {
             return;
         }
 
-        let class = |b: u8| -> u8 {
-            let ch = b as char;
-            if ch.is_whitespace() {
-                0
-            } else if ch.is_alphanumeric() || ch == '_' {
-                1
-            } else {
-                2
-            }
-        };
+        let class = char_class;
 
         i -= 1;
         while i > 0 && class(bytes[i]) == 0 {
@@ -168,6 +162,28 @@ impl VimEngine {
             }
         }
 
+        self.cursor = i;
+    }
+
+    /// `e`: jump to the last character of the current/next word.
+    fn word_end(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = self.clamp(text) + 1;
+        while i < len && char_class(bytes[i]) == 0 {
+            i += 1;
+        }
+        if i >= len {
+            return;
+        }
+        let c = char_class(bytes[i]);
+        while i + 1 < len && char_class(bytes[i + 1]) == c {
+            i += 1;
+        }
+        // Don't leave the cursor in the middle of a multi-byte character.
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
         self.cursor = i;
     }
 
@@ -378,6 +394,7 @@ impl VimEngine {
             egui::Key::J => self.move_down(text),
             egui::Key::W => self.word_forward(text),
             egui::Key::B => self.word_back(text),
+            egui::Key::E => self.word_end(text),
 
             egui::Key::Num0 => {
                 self.cursor = self.line_start(text);
@@ -478,6 +495,22 @@ impl VimEngine {
             }
             'A' => {
                 self.cursor = self.line_end(text);
+                self.mode = VimMode::Insert;
+            }
+            'I' => {
+                // Insert at the first non-blank character of the line.
+                let start = self.line_start(text);
+                let end = self.line_end(text);
+                let line = &text[start..end];
+                let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+                self.cursor = start + indent;
+                self.mode = VimMode::Insert;
+            }
+            'O' => {
+                // Open a new line above the current one.
+                let start = self.line_start(text);
+                text.insert(start, '\n');
+                self.cursor = start;
                 self.mode = VimMode::Insert;
             }
             'G' => {
@@ -1111,6 +1144,15 @@ impl EditorApp {
                     self.text = text;
                 }
                 other => {
+                    // Shifted letters (O, I, A, G, $ ...) also arrive as a Text
+                    // event, and are handled in handle_char_normal. Skipping the
+                    // Key event here stops them firing twice (e.g. Shift+O used
+                    // to run `o` as well as `O`).
+                    if modifiers.shift {
+                        self.vim.pending_d = false;
+                        self.vim.pending_y = false;
+                        continue;
+                    }
                     let edits = match other {
                         egui::Key::X | egui::Key::O | egui::Key::I | egui::Key::A => true,
                         egui::Key::D => self.vim.pending_d,
@@ -1131,7 +1173,7 @@ impl EditorApp {
                 self.vim.status_msg.clear();
                 self.vim.mode = VimMode::Command;
             } else {
-                if self.vim.pending_r {
+                if self.vim.pending_r || c == 'O' {
                     self.push_undo();
                     pushed_undo = true;
                 }
@@ -1197,6 +1239,7 @@ impl EditorApp {
                 | egui::Key::L
                 | egui::Key::W
                 | egui::Key::B
+                | egui::Key::E
                 | egui::Key::Num0
                 | egui::Key::Num4
                 | egui::Key::G => {
@@ -1625,8 +1668,8 @@ impl eframe::App for EditorApp {
                     } else {
                         ui.label(
                             egui::RichText::new(
-                                "move (j/k/l/h) word (w/b) insert (i) append (a) end-line (A) \
-                                 new-line (o) del-char (x) replace (u) del-line (dd) yank-line (yy) paste (p/P) visual (v/V) start/end (0/$)\n\
+                                "move (j/k/l/h) word (w/b/e) insert (i/I) append (a) end-line (A) \
+                                 new-line (o/O) del-char (x) replace (u) del-line (dd) yank-line (yy) paste (p/P) visual (v/V) start/end (0/$)\n\
                                  page-down (Ctrl+F) page-up (Ctrl+B) end-file (G) top-file (gg) \
                                  /search (n/N) goto-line (:n) open (:e path) files (:Ex) \
                                  save (:w) save-quit (:wq) quit (:q)",
@@ -1703,6 +1746,7 @@ impl eframe::App for EditorApp {
                             row(ui, "k", "Move up");
                             row(ui, "w", "Jump to start of next word");
                             row(ui, "b", "Jump to start of previous word");
+                            row(ui, "e", "Jump to end of word");
                             row(ui, "0", "Jump to start of line");
                             row(ui, "$", "Jump to end of line");
                             row(ui, "Ctrl+f", "Page down (20 lines)");
@@ -1712,9 +1756,11 @@ impl eframe::App for EditorApp {
 
                             section(ui, "Entering Insert Mode");
                             row(ui, "i", "Insert before cursor");
+                            row(ui, "I", "Insert at first non-blank of line");
                             row(ui, "a", "Insert after cursor (append)");
                             row(ui, "A", "Insert at end of line");
                             row(ui, "o", "Open new line below and insert");
+                            row(ui, "O", "Open new line above and insert");
                             row(ui, "Esc", "Return to Normal mode");
 
                             section(ui, "Editing");
@@ -1729,7 +1775,7 @@ impl eframe::App for EditorApp {
                             section(ui, "Visual Mode  (select text)");
                             row(ui, "v", "Start selecting characters");
                             row(ui, "V", "Start selecting whole lines");
-                            row(ui, "move", "h j k l w b 0 $ gg G extend the selection");
+                            row(ui, "move", "h j k l w b e 0 $ gg G extend the selection");
                             row(ui, "y", "Yank (copy) the selection");
                             row(ui, "d  x", "Delete (cut) the selection");
                             row(ui, "o", "Jump to the other end of the selection");
