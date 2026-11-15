@@ -4,8 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Word class used by w / b / e: 0 = whitespace, 1 = word chars, 2 = punctuation.
-fn char_class(b: u8) -> u8 {
-    let ch = b as char;
+fn char_class(ch: char) -> u8 {
     if ch.is_whitespace() {
         0
     } else if ch.is_alphanumeric() || ch == '_' {
@@ -13,6 +12,43 @@ fn char_class(b: u8) -> u8 {
     } else {
         2
     }
+}
+
+/// Largest char boundary <= `i` (and <= text.len()). Byte offsets used as a
+/// cursor must always pass through this before slicing `text`.
+fn floor_char_boundary(text: &str, i: usize) -> usize {
+    let mut i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Byte offset of the character after the one at `i` (or text.len()).
+fn next_char_boundary(text: &str, i: usize) -> usize {
+    text[i..]
+        .chars()
+        .next()
+        .map(|ch| i + ch.len_utf8())
+        .unwrap_or(text.len())
+}
+
+/// Byte offset of the character before the one at `i` (or 0).
+fn prev_char_boundary(text: &str, i: usize) -> usize {
+    text[..i]
+        .chars()
+        .next_back()
+        .map(|ch| i - ch.len_utf8())
+        .unwrap_or(0)
+}
+
+/// Byte offset of the `col`-th character in text[start..end], clamped to `end`.
+fn offset_at_col(text: &str, start: usize, end: usize, col: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(col)
+        .map(|(i, _)| start + i)
+        .unwrap_or(end)
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -72,8 +108,10 @@ impl VimEngine {
         }
     }
 
+    /// Cursor as a valid byte offset into `text`: within bounds and on a
+    /// char boundary, so slicing at it can never panic.
     fn clamp(&self, text: &str) -> usize {
-        self.cursor.min(text.len())
+        floor_char_boundary(text, self.cursor)
     }
 
     fn set_status(&mut self, msg: String) {
@@ -91,21 +129,24 @@ impl VimEngine {
         text[c..].find('\n').map(|i| c + i).unwrap_or(text.len())
     }
 
-    fn move_up(&mut self, text: &str) {
+    /// Column of the cursor in characters (not bytes).
+    fn char_col(&self, text: &str) -> usize {
         let c = self.clamp(text);
-        let col = c - self.line_start(text);
+        text[self.line_start(text)..c].chars().count()
+    }
+
+    fn move_up(&mut self, text: &str) {
+        let col = self.char_col(text);
         let prev_end = self.line_start(text).saturating_sub(1);
         if prev_end == 0 && self.line_start(text) == 0 {
             return;
         }
         let prev_start = text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let prev_len = prev_end - prev_start;
-        self.cursor = prev_start + col.min(prev_len);
+        self.cursor = offset_at_col(text, prev_start, prev_end, col);
     }
 
     fn move_down(&mut self, text: &str) {
-        let c = self.clamp(text);
-        let col = c - self.line_start(text);
+        let col = self.char_col(text);
         let end = self.line_end(text);
         if end == text.len() {
             return;
@@ -115,84 +156,79 @@ impl VimEngine {
             .find('\n')
             .map(|i| next_start + i)
             .unwrap_or(text.len());
-        let next_len = next_end - next_start;
-        self.cursor = next_start + col.min(next_len);
+        self.cursor = offset_at_col(text, next_start, next_end, col);
     }
 
     fn word_forward(&mut self, text: &str) {
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut i = self.clamp(text);
-        if i >= len {
+        let start = self.clamp(text);
+        let Some(first) = text[start..].chars().next() else {
             return;
-        }
-
-        let class = char_class;
-
-        let start_class = class(bytes[i]);
-        if start_class != 0 {
-            while i < len && class(bytes[i]) == start_class {
-                i += 1;
+        };
+        let start_class = char_class(first);
+        // Skip the rest of the current word, then any whitespace.
+        let mut in_word = start_class != 0;
+        let mut target = text.len();
+        for (o, ch) in text[start..].char_indices() {
+            let cl = char_class(ch);
+            if in_word && cl == start_class {
+                continue;
+            }
+            in_word = false;
+            if cl != 0 {
+                target = start + o;
+                break;
             }
         }
-        while i < len && class(bytes[i]) == 0 {
-            i += 1;
-        }
-
-        self.cursor = i;
+        self.cursor = target;
     }
 
     fn word_back(&mut self, text: &str) {
-        let bytes = text.as_bytes();
-        let mut i = self.clamp(text);
-        if i == 0 {
-            return;
-        }
-
-        let class = char_class;
-
-        i -= 1;
-        while i > 0 && class(bytes[i]) == 0 {
-            i -= 1;
-        }
-        if i > 0 {
-            let run_class = class(bytes[i]);
-            while i > 0 && class(bytes[i - 1]) == run_class {
-                i -= 1;
+        let c = self.clamp(text);
+        // Walk backwards: skip whitespace, then to the start of that run.
+        let mut target = 0;
+        let mut run_class = None;
+        for (i, ch) in text[..c].char_indices().rev() {
+            let cl = char_class(ch);
+            match run_class {
+                None if cl != 0 => {
+                    run_class = Some(cl);
+                    target = i;
+                }
+                None => {}
+                Some(rc) if cl == rc => target = i,
+                Some(_) => break,
             }
         }
-
-        self.cursor = i;
+        self.cursor = target;
     }
 
     /// `e`: jump to the last character of the current/next word.
     fn word_end(&mut self, text: &str) {
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut i = self.clamp(text) + 1;
-        while i < len && char_class(bytes[i]) == 0 {
-            i += 1;
+        let start = next_char_boundary(text, self.clamp(text));
+        let mut target = None;
+        let mut run_class = None;
+        for (o, ch) in text[start..].char_indices() {
+            let cl = char_class(ch);
+            match run_class {
+                None if cl != 0 => {
+                    run_class = Some(cl);
+                    target = Some(start + o);
+                }
+                None => {}
+                Some(rc) if cl == rc => target = Some(start + o),
+                Some(_) => break,
+            }
         }
-        if i >= len {
-            return;
+        if let Some(t) = target {
+            self.cursor = t;
         }
-        let c = char_class(bytes[i]);
-        while i + 1 < len && char_class(bytes[i + 1]) == c {
-            i += 1;
-        }
-        // Don't leave the cursor in the middle of a multi-byte character.
-        while i > 0 && !text.is_char_boundary(i) {
-            i -= 1;
-        }
-        self.cursor = i;
     }
 
     fn search_next(&mut self, text: &str) {
         if self.last_search.is_empty() {
             return;
         }
-        let start = self.clamp(text);
-        let from = (start + 1).min(text.len());
+        let from = next_char_boundary(text, self.clamp(text));
         if let Some(pos) = text[from..].find(&self.last_search) {
             self.cursor = from + pos;
             self.set_status(format!("/{}", self.last_search));
@@ -238,7 +274,7 @@ impl VimEngine {
     /// Byte range [start, end) covered by the current selection.
     /// For V (line-wise) it spans whole lines, not including the final '\n'.
     fn selection_range(&self, text: &str) -> (usize, usize) {
-        let a = self.visual_anchor.min(text.len());
+        let a = floor_char_boundary(text, self.visual_anchor);
         let c = self.clamp(text);
         let (lo, hi) = if a <= c { (a, c) } else { (c, a) };
         if self.mode == VimMode::VisualLine {
@@ -379,15 +415,13 @@ impl VimEngine {
                 self.pending_r = true;
             }
             egui::Key::H => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
+                self.cursor = prev_char_boundary(text, self.clamp(text));
             }
             egui::Key::L => {
                 let c = self.clamp(text);
                 let end = self.line_end(text);
                 if c < end {
-                    self.cursor += 1;
+                    self.cursor = next_char_boundary(text, c);
                 }
             }
             egui::Key::K => self.move_up(text),
@@ -446,7 +480,7 @@ impl VimEngine {
                 let c = self.clamp(text);
                 let end = self.line_end(text);
                 if c < end {
-                    self.cursor += 1;
+                    self.cursor = next_char_boundary(text, c);
                 }
                 self.mode = VimMode::Insert;
             }
@@ -747,10 +781,15 @@ impl EditorApp {
         }
     }
 
+    /// Write the buffer to disk. Leaves `dirty` set (and shows the error) if
+    /// the write fails or the Save As dialog is cancelled.
     fn save_file(&mut self) {
         if let Some(path) = &self.file_path {
-            if fs::write(path, &self.text).is_ok() {
-                self.dirty = false;
+            match fs::write(path, &self.text) {
+                Ok(_) => self.dirty = false,
+                Err(e) => self
+                    .vim
+                    .set_status(format!("Can't write {}: {}", path.display(), e)),
             }
         } else {
             self.save_as();
@@ -772,6 +811,12 @@ impl EditorApp {
             "w" => {
                 if self.file_path.is_some() {
                     self.save_file();
+                    if self.dirty {
+                        // save_file already reported the error.
+                        self.vim.command_buf.clear();
+                        self.vim.mode = VimMode::Normal;
+                        return;
+                    }
                     let name = self
                         .file_path
                         .as_ref()
@@ -787,20 +832,35 @@ impl EditorApp {
             "w!" => {
                 if self.file_path.is_some() {
                     self.save_file();
-                    self.vim.set_status("written (forced)".to_string());
+                    if !self.dirty {
+                        self.vim.set_status("written (forced)".to_string());
+                    }
                 } else {
                     self.pending_save_as = true;
                 }
             }
             "q" => {
-                std::process::exit(0);
+                if self.dirty {
+                    self.vim.set_status(
+                        "E37: No write since last change (add ! to override)".to_string(),
+                    );
+                } else {
+                    std::process::exit(0);
+                }
             }
             "q!" => {
                 std::process::exit(0);
             }
             "wq" | "x" => {
                 self.save_file();
-                std::process::exit(0);
+                // Only quit if the save actually succeeded.
+                if !self.dirty {
+                    std::process::exit(0);
+                }
+                if self.vim.status_msg.is_empty() {
+                    self.vim
+                        .set_status("Not saved, not quitting (:q! to discard)".to_string());
+                }
             }
             other if other.starts_with("w ") => {
                 let path = PathBuf::from(other[2..].trim());
@@ -924,7 +984,7 @@ impl EditorApp {
     fn undo(&mut self) {
         if let Some((text, cursor)) = self.undo_stack.pop() {
             self.text = text;
-            self.vim.cursor = cursor.min(self.text.len());
+            self.vim.cursor = floor_char_boundary(&self.text, cursor);
             self.dirty = true;
             self.vim.set_status("undo".to_string());
         } else {
@@ -1126,7 +1186,7 @@ impl EditorApp {
                 }
                 egui::Key::V => {
                     // Start a selection at the cursor.
-                    self.vim.visual_anchor = self.vim.cursor.min(self.text.len());
+                    self.vim.visual_anchor = self.vim.clamp(&self.text);
                     self.vim.pending_d = false;
                     self.vim.pending_y = false;
                     self.vim.pending_g = false;
@@ -1589,9 +1649,7 @@ impl eframe::App for EditorApp {
                         self.last_cursor = self.vim.cursor;
                     } else {
                         let te_id = ui.make_persistent_id("main_text_edit");
-                        let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
-                            .chars()
-                            .count();
+                        let char_idx = self.text[..self.vim.clamp(&self.text)].chars().count();
                         let mut state =
                             egui::TextEdit::load_state(ui.ctx(), te_id).unwrap_or_default();
                         let mut ccursor = egui::text::CCursor::new(char_idx);
@@ -1943,7 +2001,7 @@ impl eframe::App for EditorApp {
                     self.process_vim_search(ctx);
                 }
 
-                let c = self.vim.cursor.min(self.text.len());
+                let c = self.vim.clamp(&self.text);
 
                 let cursor_line = self.text[..c].chars().filter(|&ch| ch == '\n').count();
                 let total_lines = self.text.chars().filter(|&ch| ch == '\n').count() + 1;
@@ -2006,9 +2064,7 @@ impl eframe::App for EditorApp {
                 let just_entered_insert = entering_insert_now;
 
                 if just_entered_insert {
-                    let char_idx = self.text[..self.vim.cursor.min(self.text.len())]
-                        .chars()
-                        .count();
+                    let char_idx = self.text[..self.vim.clamp(&self.text)].chars().count();
                     let mut state = egui::TextEdit::load_state(ui.ctx(), te_id).unwrap_or_default();
                     let mut ccursor = egui::text::CCursor::new(char_idx);
                     ccursor.prefer_next_row = false;
@@ -2030,7 +2086,7 @@ impl eframe::App for EditorApp {
 
                 let gutter_job = if self.show_line_numbers {
                     let total_lines = self.text.chars().filter(|&ch| ch == '\n').count() + 1;
-                    let cur = self.vim.cursor.min(self.text.len());
+                    let cur = self.vim.clamp(&self.text);
                     let current_line = self.text[..cur].chars().filter(|&ch| ch == '\n').count();
                     Some(self.gutter_job(total_lines, current_line))
                 } else {
