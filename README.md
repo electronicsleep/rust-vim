@@ -6,6 +6,8 @@ Hyper efficient with essential Vim support
 
 Verified working quicky on even a Raspberry Pi 400
 
+Using the most productive vim motions
+
 Vim toggle and on screen help for learning
 
 Minimal dependencies
@@ -14,6 +16,7 @@ Works on Mac and Linux
 
 Run and open file or folders
 
+Run via cargo
 ```
 cargo run -- README.md
 cargo run -- .

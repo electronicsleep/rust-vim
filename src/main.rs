@@ -684,6 +684,10 @@ struct EditorApp {
     show_file_panel: bool,
     /// File the user asked to open while the current buffer had unsaved changes.
     pending_switch: Option<PathBuf>,
+    /// The window's close button was pressed while the buffer had unsaved changes.
+    show_close_prompt: bool,
+    /// Set once the user has chosen Save/Discard, so the next close goes through.
+    allow_close: bool,
 }
 
 impl Default for EditorApp {
@@ -711,6 +715,8 @@ impl Default for EditorApp {
             file_tree: None,
             show_file_panel: false,
             pending_switch: None,
+            show_close_prompt: false,
+            allow_close: false,
         }
     }
 }
@@ -916,6 +922,17 @@ impl EditorApp {
         }
         self.vim.command_buf.clear();
         self.vim.mode = VimMode::Normal;
+    }
+
+    /// Called when the OS/window close button is pressed. Returns true if the
+    /// close must be cancelled (unsaved changes and the user hasn't decided yet).
+    fn intercept_close(&mut self) -> bool {
+        if self.dirty && !self.allow_close {
+            self.show_close_prompt = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn gutter_job(&mut self, total_lines: usize, current_line: usize) -> egui::text::LayoutJob {
@@ -1599,6 +1616,11 @@ fn build_highlight_job(
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Window close button: don't lose unsaved changes ----
+        if ctx.input(|i| i.viewport().close_requested()) && self.intercept_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
         let entering_insert_now =
             self.vim.mode == VimMode::Insert && self.prev_mode != VimMode::Insert;
         self.prev_mode = self.vim.mode;
@@ -1931,6 +1953,61 @@ impl eframe::App for EditorApp {
             }
         }
 
+        // ---- Unsaved-changes prompt when closing the window ----
+        if self.show_close_prompt {
+            let cur_name = self
+                .file_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled")
+                .to_string();
+
+            // 0 = save, 1 = discard, 2 = cancel
+            let mut choice: Option<u8> = None;
+            egui::Window::new("Quit with unsaved changes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Save changes to \"{}\" before quitting?", cur_name));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            choice = Some(0);
+                        }
+                        if ui.button("Discard").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(2);
+                        }
+                    });
+                });
+
+            match choice {
+                Some(0) => {
+                    self.save_file();
+                    // If the save failed or Save As was cancelled, keep the
+                    // prompt open; save_file has already shown the error.
+                    if !self.dirty {
+                        self.show_close_prompt = false;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Some(1) => {
+                    self.show_close_prompt = false;
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(2) => {
+                    self.show_close_prompt = false;
+                }
+                _ => {}
+            }
+        }
+
         // ---- File sidebar (must be added before the CentralPanel) ----
         let mut clicked: Option<PathBuf> = None;
         if self.show_file_panel {
@@ -2182,4 +2259,152 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(EditorApp::from_path(path)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run a sequence of normal-mode keys, asserting the cursor always stays
+    /// on a char boundary (any slice at a non-boundary would panic anyway).
+    fn press(vim: &mut VimEngine, text: &mut String, keys: &[egui::Key]) {
+        for &k in keys {
+            vim.handle_normal_key(k, text);
+            assert!(
+                text.is_char_boundary(vim.cursor.min(text.len())),
+                "cursor {} not on a char boundary after {:?} in {:?}",
+                vim.cursor,
+                k,
+                text
+            );
+        }
+    }
+
+    const SAMPLES: &[&str] = &[
+        "café au lait",
+        "naïve résumé à la carte",
+        "hi 👋🏽 there 🎉!",
+        "日本語のテキスト 漢字",
+        "àà\nb\n日本\n😀😀😀",
+    ];
+
+    #[test]
+    fn h_and_l_step_whole_characters() {
+        use egui::Key::*;
+        for s in SAMPLES {
+            let mut text = s.to_string();
+            let mut vim = VimEngine::new();
+            press(
+                &mut vim,
+                &mut text,
+                &[L, L, L, L, L, L, L, L, H, H, H, L, L],
+            );
+        }
+        let mut text = "é".to_string();
+        let mut vim = VimEngine::new();
+        press(&mut vim, &mut text, &[egui::Key::A]);
+        assert_eq!(vim.cursor, 2);
+    }
+
+    #[test]
+    fn j_and_k_keep_character_column() {
+        use egui::Key::*;
+        let mut text = "日本語\nabc\néé".to_string();
+        let mut vim = VimEngine::new();
+        press(&mut vim, &mut text, &[L, L, J]);
+        assert_eq!(&text[vim.cursor..vim.cursor + 1], "c");
+        press(&mut vim, &mut text, &[J, K, K]);
+        assert_eq!(&text[vim.cursor..], "語\nabc\néé");
+    }
+
+    #[test]
+    fn word_motions_on_multibyte_text() {
+        use egui::Key::*;
+        for s in SAMPLES {
+            let mut text = s.to_string();
+            let mut vim = VimEngine::new();
+            press(&mut vim, &mut text, &[W, W, W, W, W, W, W, W]);
+            press(&mut vim, &mut text, &[B, B, B, B, B, B, B, B]);
+            assert_eq!(vim.cursor, 0, "b should return to start of {:?}", s);
+            press(&mut vim, &mut text, &[E, E, E, E, E, E]);
+        }
+        let mut text = "naïve résumé".to_string();
+        let mut vim = VimEngine::new();
+        press(&mut vim, &mut text, &[W]);
+        assert_eq!(&text[vim.cursor..], "résumé");
+        press(&mut vim, &mut text, &[E]);
+        assert_eq!(&text[vim.cursor..], "é");
+    }
+
+    #[test]
+    fn x_deletes_whole_character() {
+        let mut text = "😀b".to_string();
+        let mut vim = VimEngine::new();
+        press(&mut vim, &mut text, &[egui::Key::X]);
+        assert_eq!(text, "b");
+    }
+
+    #[test]
+    fn search_from_multibyte_cursor() {
+        let text = "éa éa".to_string();
+        let mut vim = VimEngine::new();
+        vim.last_search = "é".to_string();
+        vim.search_next(&text);
+        assert_eq!(vim.cursor, 4);
+        vim.search_next(&text);
+        assert_eq!(vim.cursor, 0);
+    }
+
+    #[test]
+    fn stale_mid_char_cursor_is_clamped() {
+        let text = "é".to_string();
+        let mut vim = VimEngine::new();
+        vim.cursor = 1; // inside 'é'
+        assert_eq!(vim.clamp(&text), 0);
+        assert_eq!(vim.line_start(&text), 0);
+        vim.mode = VimMode::Visual;
+        vim.visual_anchor = 1;
+        assert_eq!(vim.selection_range(&text), (0, 2));
+    }
+
+    fn app_with(text: &str, dirty: bool) -> EditorApp {
+        let mut app = EditorApp::default();
+        app.text = text.to_string();
+        app.dirty = dirty;
+        app
+    }
+
+    #[test]
+    fn q_refuses_with_unsaved_changes() {
+        let mut app = app_with("hello", true);
+        app.vim.command_buf = "q".to_string();
+        app.execute_command(); // would exit the test process if it quit
+        assert!(app.vim.status_msg.starts_with("E37"));
+        assert_eq!(app.vim.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn close_button_blocked_only_with_unsaved_changes() {
+        let mut clean = app_with("hello", false);
+        assert!(!clean.intercept_close());
+        assert!(!clean.show_close_prompt);
+
+        let mut dirty = app_with("hello", true);
+        assert!(dirty.intercept_close());
+        assert!(dirty.show_close_prompt);
+
+        // After the user picks Save/Discard, the close goes through.
+        dirty.allow_close = true;
+        assert!(!dirty.intercept_close());
+    }
+
+    #[test]
+    fn wq_does_not_quit_when_write_fails() {
+        let mut app = app_with("hello", true);
+        app.file_path = Some(PathBuf::from("/nonexistent-dir/x/y.txt"));
+        app.vim.command_buf = "wq".to_string();
+        app.execute_command();
+        assert!(app.dirty);
+        assert!(app.vim.status_msg.starts_with("Can't write"));
+    }
 }
